@@ -140,7 +140,7 @@ public:
     JsonWithExtBuf doc;
     doc.setJson(nlohmann::json::parse(payload));
 
-    const AiFilterContext context{stream_info_, request_headers_,
+    const AiFilterContext context{*dispatcher_, stream_info_, request_headers_,
                                   LLMProtocol::OpenAiChatCompletions, payload.size()};
     std::vector<AiFilterSharedPtr> filters;
     if (with_request_info) {

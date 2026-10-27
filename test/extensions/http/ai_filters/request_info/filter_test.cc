@@ -75,7 +75,7 @@ public:
     std::vector<AiFilterSharedPtr> filters;
     filters.push_back(std::make_unique<RequestInfoFilter>(
         config != nullptr ? std::move(config) : makeConfig(),
-        AiFilterContext{stream_info_, request_headers_, protocol, payload.size()}));
+        AiFilterContext{*dispatcher_, stream_info_, request_headers_, protocol, payload.size()}));
     FilterManager manager(std::move(filters));
 
     absl::Status status;

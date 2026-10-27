@@ -169,7 +169,8 @@ public:
   // What the AI Protocol Manager hands each filter of the stream: the client's dialect, as the
   // route's request protocol, and the backend's, as its response protocol (`target_protocol_`).
   AiFilterContext makeContext(LLMProtocol source_protocol) {
-    return AiFilterContext{.stream_info = stream_info_,
+    return AiFilterContext{.dispatcher = *dispatcher_,
+                           .stream_info = stream_info_,
                            .request_headers = request_headers_,
                            .request_protocol = source_protocol,
                            .response_protocol = target_protocol_,
@@ -1148,7 +1149,7 @@ public:
     StreamInfo::StreamInfoImpl stream_info(api_->timeSource(), nullptr,
                                            StreamInfo::FilterState::LifeSpan::FilterChain);
     Http::TestRequestHeaderMapImpl request_headers{{":method", "POST"}, {":path", "/"}};
-    const AiFilterContext context{stream_info, request_headers,
+    const AiFilterContext context{*dispatcher_, stream_info, request_headers,
                                   /*request_protocol=*/
                                   to_ir ? LLMProtocol::OpenAiChatCompletions : dialect,
                                   /*request_payload_bytes=*/0,

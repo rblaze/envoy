@@ -132,7 +132,7 @@ public:
     RouteSelectorProto proto;
     auto config =
         std::make_shared<const RouteSelectorFilterConfig>(proto, *stats_store_.rootScope());
-    const AiFilterContext context{stream_info_, request_headers_,
+    const AiFilterContext context{*dispatcher_, stream_info_, request_headers_,
                                   LLMProtocol::OpenAiChatCompletions, payload.size()};
     std::vector<AiFilterSharedPtr> filters;
     filters.push_back(std::make_shared<RouteSelectorFilter>(std::move(config), context));

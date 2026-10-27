@@ -9,6 +9,7 @@
 
 #include "envoy/common/pure.h"
 #include "envoy/config/typed_config.h"
+#include "envoy/event/dispatcher.h"
 #include "envoy/http/codes.h"
 #include "envoy/http/header_map.h"
 #include "envoy/server/factory_context.h"
@@ -143,6 +144,7 @@ using AiFilterSharedPtr = std::shared_ptr<AiFilter>;
 // Per-stream inputs for an AI filter; copy it. The referents belong to the stream, so a filter
 // must not use them after propagating the request, replying locally, or an await failing.
 struct AiFilterContext {
+  Event::Dispatcher& dispatcher;
   StreamInfo::StreamInfo& stream_info;
   // Held back until the chain finishes, so a rewrite made before propagating reaches the upstream.
   Http::RequestHeaderMap& request_headers;

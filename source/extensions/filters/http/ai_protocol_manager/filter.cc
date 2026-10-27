@@ -502,7 +502,8 @@ void AiProtocolManagerFilter::finalizeDecode(bool has_trailers) {
 
   if (isAiEndpoint() && !decode_manager_->empty() && !payload_rejected_) {
     ASSERT(request_headers_ != nullptr);
-    const AiFilterContext context{.stream_info = decoder_callbacks_->streamInfo(),
+    const AiFilterContext context{.dispatcher = decoder_callbacks_->dispatcher(),
+                                  .stream_info = decoder_callbacks_->streamInfo(),
                                   .request_headers = *request_headers_,
                                   .request_protocol = request_protocol_,
                                   .request_payload_bytes = decode_manager_->length(),

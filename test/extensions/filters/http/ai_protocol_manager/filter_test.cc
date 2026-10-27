@@ -1406,6 +1406,7 @@ TEST_F(AiProtocolManagerFilterTest, ParsesDeclaredEndpointPayloadAndReplaysItVer
 class ContextRecordingAiFilter : public AiFilter {
 public:
   struct Seen {
+    const Event::Dispatcher* dispatcher;
     LLMProtocol protocol;
     LLMProtocol request_protocol;
     std::string path;
@@ -1425,7 +1426,7 @@ public:
                                        AiRequestPropagator propagate_request,
                                        LocalReplier) override {
     ASSIGN_OR_CO_RETURN(AiRequestPtr request, co_await std::move(receive_request)());
-    seen_.push_back({context_.request_protocol, request->protocol(),
+    seen_.push_back({&context_.dispatcher, context_.request_protocol, request->protocol(),
                      std::string(context_.request_headers.getPathValue()), &context_.stream_info,
                      context_.request_payload_bytes, context_.request_binding,
                      context_.response_binding});
@@ -1487,6 +1488,7 @@ TEST_F(AiProtocolManagerFilterTest, RunsConfiguredAiFiltersOverDeclaredPayload) 
   EXPECT_EQ(local_reply_calls_, 0);
   EXPECT_EQ(built, 1);
   ASSERT_EQ(seen.size(), 1);
+  EXPECT_EQ(seen[0].dispatcher, &callbacks_.dispatcher_);
   EXPECT_EQ(seen[0].protocol, LLMProtocol::OpenAiChatCompletions);
   EXPECT_EQ(seen[0].request_protocol, LLMProtocol::OpenAiChatCompletions);
   EXPECT_EQ(seen[0].path, "/chat/completions");
@@ -1589,6 +1591,7 @@ TEST_F(AiProtocolManagerFilterStateTest, RouteBindingsTheChainAppliesAreNotCount
 TEST_F(AiProtocolManagerFilterStateTest, UnspecifiedFilterStateLeavesTheRoute) {
   const auto seen = runWithFilterState(LLMProtocol::Unspecified);
   ASSERT_EQ(seen.size(), 1);
+  EXPECT_EQ(seen[0].dispatcher, &callbacks_.dispatcher_);
   EXPECT_EQ(seen[0].protocol, LLMProtocol::OpenAiChatCompletions);
   EXPECT_EQ(seen[0].request_protocol, LLMProtocol::OpenAiChatCompletions);
 }

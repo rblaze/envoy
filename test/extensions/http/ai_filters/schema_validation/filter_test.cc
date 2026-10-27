@@ -76,7 +76,7 @@ public:
     std::vector<AiFilterSharedPtr> filters;
     filters.push_back(std::make_shared<SchemaValidationFilter>(
         std::make_shared<const SchemaValidationFilterConfig>(proto, *stats_store_.rootScope()),
-        AiFilterContext{stream_info_, request_headers_, declared_protocol}));
+        AiFilterContext{*dispatcher_, stream_info_, request_headers_, declared_protocol}));
     filters.push_back(std::make_shared<ProtocolRecordingFilter>(seen_protocol_));
     FilterManager manager(std::move(filters));
 

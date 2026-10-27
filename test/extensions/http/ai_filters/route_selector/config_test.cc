@@ -47,7 +47,8 @@ TEST(RouteSelectorConfigTest, CreatesFilterFromEmptyConfig) {
 
   NiceMock<StreamInfo::MockStreamInfo> stream_info;
   Http::TestRequestHeaderMapImpl headers{{":method", "POST"}, {":path", "/"}};
-  const AiFilterContext stream_context{stream_info, headers, LLMProtocol::OpenAiChatCompletions};
+  const AiFilterContext stream_context{context.dispatcher_, stream_info, headers,
+                                       LLMProtocol::OpenAiChatCompletions};
   EXPECT_NE((*factory_cb)(stream_context), nullptr);
 }
 

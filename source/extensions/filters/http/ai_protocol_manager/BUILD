@@ -400,6 +400,7 @@ envoy_cc_library(
         ":token_usage_lib",
         "//envoy/common:pure_lib",
         "//envoy/config:typed_config_interface",
+        "//envoy/event:dispatcher_interface",
         "//envoy/http:codes_interface",
         "//envoy/http:header_map_interface",
         "//envoy/server:factory_context_interface",
