@@ -636,6 +636,19 @@ libpfm:
   use_category:
   - test_only
 
+postgres:
+  project_name: "PostgreSQL (C client library)"
+  project_desc: "Open source database server"
+  project_url: "https://www.postgresql.org/"
+  release_date: "2026-05-11"
+  use_category:
+  - dataplane_ext
+  extensions:
+  - envoy.http.ai_filters.model_router
+  license: "PostgreSQL"
+  license_url: "https://github.com/postgres/postgres/blob/v{version}/LICENSE"
+  cpe: "cpe:2.3:a:postgresql:postgresql:*"
+
 libprotobuf_mutator:
   project_name: "libprotobuf-mutator"
   project_desc: "Library to randomly mutate protobuffers"

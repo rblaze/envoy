@@ -60,6 +60,12 @@ alias(
 )
 
 alias(
+    name = "libpq",
+    actual = "@postgres//:pq",
+    visibility = ["//visibility:public"],
+)
+
+alias(
     name = "librdkafka",
     actual = "@librdkafka//:librdkafka_cpp",
     visibility = ["//visibility:public"],
