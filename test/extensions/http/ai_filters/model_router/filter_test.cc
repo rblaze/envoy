@@ -4,11 +4,13 @@
 #include <utility>
 #include <vector>
 
+#include "envoy/data/ai/v3/token_usage.pb.h"
 #include "envoy/extensions/http/ai_filters/model_router/v3/model_router.pb.h"
 #include "envoy/extensions/http/ai_filters/request_info/v3/request_info.pb.h"
 #include "envoy/type/ai/v3/llm_binding.pb.h"
 #include "envoy/type/ai/v3/llm_protocol.pb.h"
 
+#include "source/common/coroutine/task.h"
 #include "source/common/router/string_accessor_impl.h"
 #include "source/common/stream_info/stream_info_impl.h"
 #include "source/extensions/filters/http/ai_protocol_manager/ai_filter.h"
@@ -17,18 +19,22 @@
 #include "source/extensions/filters/http/ai_protocol_manager/external_buffer_impl.h"
 #include "source/extensions/filters/http/ai_protocol_manager/filter_manager.h"
 #include "source/extensions/filters/http/ai_protocol_manager/json_with_ext_buf.h"
+#include "source/extensions/http/ai_filters/model_router/database_interface.h"
 #include "source/extensions/http/ai_filters/model_router/filter.h"
 #include "source/extensions/http/ai_filters/model_router/route_wrapper.h"
 #include "source/extensions/http/ai_filters/request_info/filter.h"
 
 #include "test/extensions/filters/http/ai_protocol_manager/fake_bridge.h"
 #include "test/mocks/stats/mocks.h"
+#include "test/mocks/thread_local/mocks.h"
 #include "test/test_common/utility.h"
 
+#include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "nlohmann/json.hpp"
 
 using testing::NiceMock;
+using testing::StrictMock;
 
 namespace Envoy {
 namespace Extensions {
@@ -47,16 +53,35 @@ using HttpFilters::AiProtocolManager::LLMProtocol;
 namespace FilterStateKeys = HttpFilters::AiProtocolManager::FilterStateKeys;
 using ModelRouterProto = envoy::extensions::http::ai_filters::model_router::v3::ModelRouter;
 
+class MockDatabase : public DatabaseInterface {
+public:
+  static Coroutine::Task<absl::Status> makeStatusTask(absl::Status status) { co_return status; }
+
+  MOCK_METHOD(Coroutine::Task<absl::Status>, recordQueryStats,
+              (Envoy::SystemTime request_time, uint64_t input_tokens, uint64_t output_tokens,
+               std::string model, std::string provider, std::string request_id),
+              (override));
+};
+
 class ModelRouterFilterTest : public testing::Test {
 public:
   ModelRouterFilterTest()
       : api_(Api::createApiForTest()), dispatcher_(api_->allocateDispatcher("test")),
         bridge_(*dispatcher_), buffer_manager_(BufferManager::Config{}, factory_, bridge_),
-        stream_info_(api_->timeSource(), nullptr, StreamInfo::FilterState::LifeSpan::FilterChain) {}
+        response_buffer_manager_(BufferManager::Config{}, factory_, bridge_),
+        stream_info_(api_->timeSource(), nullptr, StreamInfo::FilterState::LifeSpan::FilterChain),
+        mock_db_(std::make_shared<StrictMock<MockDatabase>>()) {
+    ON_CALL(*mock_db_, recordQueryStats)
+        .WillByDefault([](Envoy::SystemTime, uint64_t, uint64_t, std::string, std::string,
+                          std::string) { return MockDatabase::makeStatusTask(absl::OkStatus()); });
+  }
 
-  ~ModelRouterFilterTest() override { buffer_manager_.onDestroy(); }
+  ~ModelRouterFilterTest() override {
+    buffer_manager_.onDestroy();
+    response_buffer_manager_.onDestroy();
+  }
 
-  ModelRouterFilterConfigSharedPtr defaultConfig() {
+  ModelRouterFilterConfigSharedPtr defaultConfig(bool with_db = false) {
     ModelRouterProto proto;
 
     auto* anthropic_prov = proto.add_providers();
@@ -121,7 +146,14 @@ public:
     auto* empty_entry = proto.add_routes();
     empty_entry->set_requested_model("empty_targets_model");
 
-    auto config_or = ModelRouterFilterConfig::create(proto, *stats_store_.rootScope());
+    ModelRouterFilterConfig::DbPtr tl_database;
+    if (with_db) {
+      tl_database = ThreadLocal::TypedSlot<DatabaseInterface>::makeUnique(tls_);
+      tl_database->set([db = mock_db_](Event::Dispatcher&) { return db; });
+    }
+
+    auto config_or =
+        ModelRouterFilterConfig::create(proto, *stats_store_.rootScope(), std::move(tl_database));
     EXPECT_TRUE(config_or.ok()) << config_or.status();
     return *std::move(config_or);
   }
@@ -132,11 +164,28 @@ public:
                                         StreamInfo::FilterState::LifeSpan::FilterChain);
   }
 
-  std::string run(const std::string& payload = R"({"model":"send_me_to_anthropic","messages":[]})",
-                  ModelRouterFilterConfigSharedPtr config = nullptr,
-                  bool with_request_info = false) {
-    request_headers_ = Http::TestRequestHeaderMapImpl{
-        {":method", "POST"}, {":path", "/v1/chat/completions"}, {":authority", "original.host"}};
+  void setTokenUsageInMetadata(uint64_t input_tokens, uint64_t output_tokens,
+                               envoy::data::ai::v3::TokenUsage::ExtractionStatus status =
+                                   envoy::data::ai::v3::TokenUsage::COMPLETE) {
+    envoy::data::ai::v3::TokenUsage token_usage;
+    token_usage.set_extraction_status(status);
+    if (status != envoy::data::ai::v3::TokenUsage::FAILED) {
+      token_usage.mutable_input_tokens()->set_value(input_tokens);
+      token_usage.mutable_output_tokens()->set_value(output_tokens);
+      token_usage.mutable_total_tokens()->set_value(input_tokens + output_tokens);
+    }
+    Protobuf::Any typed_any;
+    MessageUtil::packFrom(typed_any, token_usage);
+    stream_info_.setDynamicTypedMetadata("envoy.ai.token_usage", typed_any);
+  }
+
+  std::unique_ptr<FilterManager>
+  startDecode(const std::string& payload = R"({"model":"send_me_to_anthropic","messages":[]})",
+              ModelRouterFilterConfigSharedPtr config = nullptr, bool with_request_info = false) {
+    request_headers_ = Http::TestRequestHeaderMapImpl{{":method", "POST"},
+                                                      {":path", "/v1/chat/completions"},
+                                                      {":authority", "original.host"},
+                                                      {"x-request-id", "test-req-id"}};
     JsonWithExtBuf doc;
     doc.setJson(nlohmann::json::parse(payload));
 
@@ -152,11 +201,11 @@ public:
     }
     filters.push_back(std::make_shared<ModelRouterFilter>(
         config != nullptr ? std::move(config) : defaultConfig(), context));
-    FilterManager manager(std::move(filters));
+    auto manager = std::make_unique<FilterManager>(std::move(filters));
 
     absl::Status status;
     bool completed = false;
-    manager.startRequest(
+    manager->startRequest(
         std::move(doc), &buffer_manager_, *dispatcher_, stream_info_,
         [&status, &completed](absl::Status s) {
           status = std::move(s);
@@ -164,6 +213,51 @@ public:
         },
         &request_headers_, /*local_reply_fn=*/nullptr, /*always_serialize=*/true,
         LLMProtocol::OpenAiChatCompletions);
+    for (int i = 0; i < 20; ++i) {
+      dispatcher_->run(Event::Dispatcher::RunType::NonBlock);
+    }
+    EXPECT_TRUE(completed);
+    EXPECT_TRUE(status.ok()) << status;
+    return manager;
+  }
+
+  std::string run(const std::string& payload = R"({"model":"send_me_to_anthropic","messages":[]})",
+                  ModelRouterFilterConfigSharedPtr config = nullptr,
+                  bool with_request_info = false) {
+    auto manager = startDecode(payload, std::move(config), with_request_info);
+    return bridge_.injected_.toString();
+  }
+
+  std::string runSseResponse(FilterManager& manager, const std::string& sse_payload) {
+    bridge_.injected_.drain(bridge_.injected_.length());
+    absl::Status status;
+    bool completed = false;
+    manager.startSseResponse(factory_, bridge_, response_buffer_manager_,
+                             [&status, &completed](absl::Status s) {
+                               status = std::move(s);
+                               completed = true;
+                             });
+    Buffer::OwnedImpl response_data(sse_payload);
+    manager.onResponseData(response_data, /*end_stream=*/true);
+    for (int i = 0; i < 20; ++i) {
+      dispatcher_->run(Event::Dispatcher::RunType::NonBlock);
+    }
+    EXPECT_TRUE(completed);
+    EXPECT_TRUE(status.ok()) << status;
+    return bridge_.injected_.toString();
+  }
+
+  std::string runUnaryResponse(FilterManager& manager, const std::string& unary_payload) {
+    bridge_.injected_.drain(bridge_.injected_.length());
+    absl::Status status;
+    bool completed = false;
+    manager.startUnaryResponse(factory_, bridge_, response_buffer_manager_,
+                               [&status, &completed](absl::Status s) {
+                                 status = std::move(s);
+                                 completed = true;
+                               });
+    Buffer::OwnedImpl response_data(unary_payload);
+    manager.onResponseData(response_data, /*end_stream=*/true);
     for (int i = 0; i < 20; ++i) {
       dispatcher_->run(Event::Dispatcher::RunType::NonBlock);
     }
@@ -188,8 +282,11 @@ public:
   InMemoryExternalBufferFactory factory_;
   FakeBridge bridge_;
   BufferManager buffer_manager_;
+  BufferManager response_buffer_manager_;
   StreamInfo::StreamInfoImpl stream_info_;
   NiceMock<Stats::MockIsolatedStatsStore> stats_store_;
+  NiceMock<ThreadLocal::MockInstance> tls_;
+  std::shared_ptr<StrictMock<MockDatabase>> mock_db_;
   Http::TestRequestHeaderMapImpl request_headers_;
 };
 
@@ -300,6 +397,201 @@ TEST_F(ModelRouterFilterTest, ChainedWithRequestInfoFilter) {
   EXPECT_EQ(request_headers_.getHostValue(), "api.anthropic.com");
   EXPECT_EQ(request_headers_.getEnvoyMaxRetriesValue(), "0");
   EXPECT_EQ(counterValue("success"), 1);
+}
+
+TEST_F(ModelRouterFilterTest, EncodeSSEPassThrough) {
+  request_headers_ = Http::TestRequestHeaderMapImpl{
+      {":method", "POST"}, {":path", "/v1/chat/completions"}, {":authority", "original.host"}};
+
+  envoy::data::ai::v3::TokenUsage token_usage;
+  token_usage.set_model("gpt-4o");
+  token_usage.mutable_input_tokens()->set_value(123);
+  token_usage.mutable_output_tokens()->set_value(45);
+  token_usage.mutable_total_tokens()->set_value(168);
+  Protobuf::Any typed_any;
+  MessageUtil::packFrom(typed_any, token_usage);
+  stream_info_.setDynamicTypedMetadata("envoy.ai.token_usage", typed_any);
+
+  const AiFilterContext context{*dispatcher_, stream_info_, request_headers_,
+                                LLMProtocol::OpenAiChatCompletions, 0};
+  std::vector<AiFilterSharedPtr> filters;
+  filters.push_back(std::make_shared<ModelRouterFilter>(defaultConfig(), context));
+  FilterManager manager(std::move(filters));
+
+  absl::Status status;
+  bool completed = false;
+  manager.startSseResponse(factory_, bridge_, buffer_manager_,
+                           [&status, &completed](absl::Status s) {
+                             status = std::move(s);
+                             completed = true;
+                           });
+
+  const std::string sse_payload = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"
+                                  "data: [DONE]\n\n";
+  Buffer::OwnedImpl response_data(sse_payload);
+  manager.onResponseData(response_data, /*end_stream=*/true);
+
+  for (int i = 0; i < 20; ++i) {
+    dispatcher_->run(Event::Dispatcher::RunType::NonBlock);
+  }
+
+  EXPECT_TRUE(completed);
+  EXPECT_TRUE(status.ok()) << status;
+  EXPECT_EQ(bridge_.injected_.toString(), sse_payload);
+}
+
+TEST_F(ModelRouterFilterTest, EncodeUnaryPassThrough) {
+  request_headers_ = Http::TestRequestHeaderMapImpl{
+      {":method", "POST"}, {":path", "/v1/chat/completions"}, {":authority", "original.host"}};
+
+  envoy::data::ai::v3::TokenUsage token_usage;
+  token_usage.set_model("claude-haiku-4-5");
+  token_usage.mutable_input_tokens()->set_value(50);
+  token_usage.mutable_output_tokens()->set_value(25);
+  token_usage.mutable_total_tokens()->set_value(75);
+  Protobuf::Any typed_any;
+  MessageUtil::packFrom(typed_any, token_usage);
+  stream_info_.setDynamicTypedMetadata("envoy.ai.token_usage", typed_any);
+
+  const AiFilterContext context{*dispatcher_, stream_info_, request_headers_,
+                                LLMProtocol::OpenAiChatCompletions, 0};
+  std::vector<AiFilterSharedPtr> filters;
+  filters.push_back(std::make_shared<ModelRouterFilter>(defaultConfig(), context));
+  FilterManager manager(std::move(filters));
+
+  absl::Status status;
+  bool completed = false;
+  manager.startUnaryResponse(factory_, bridge_, buffer_manager_,
+                             [&status, &completed](absl::Status s) {
+                               status = std::move(s);
+                               completed = true;
+                             });
+
+  const std::string unary_payload = R"({"id":"msg_1","model":"claude-haiku-4-5","content":"ok"})";
+  Buffer::OwnedImpl response_data(unary_payload);
+  manager.onResponseData(response_data, /*end_stream=*/true);
+
+  for (int i = 0; i < 20; ++i) {
+    dispatcher_->run(Event::Dispatcher::RunType::NonBlock);
+  }
+
+  EXPECT_TRUE(completed);
+  EXPECT_TRUE(status.ok()) << status;
+  EXPECT_EQ(nlohmann::json::parse(bridge_.injected_.toString()),
+            nlohmann::json::parse(unary_payload));
+}
+
+TEST_F(ModelRouterFilterTest, EncodeSSERecordsTokenUsageToDatabase) {
+  setModelInFilterState("send_me_to_anthropic");
+  stream_info_.setAttemptCount(1);
+  setTokenUsageInMetadata(123, 45);
+
+  auto manager = startDecode(R"({"model":"send_me_to_anthropic","messages":[]})",
+                             defaultConfig(/*with_db=*/true));
+
+  EXPECT_CALL(*mock_db_, recordQueryStats(stream_info_.startTime(), 123, 45, "claude-haiku-4-5",
+                                          "anthropic", "test-req-id"));
+
+  const std::string sse_payload = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"
+                                  "data: [DONE]\n\n";
+  EXPECT_EQ(runSseResponse(*manager, sse_payload), sse_payload);
+}
+
+TEST_F(ModelRouterFilterTest, EncodeUnaryRecordsTokenUsageForRetryAttempt) {
+  setModelInFilterState("multi_fallback_model");
+  stream_info_.setAttemptCount(2);
+  setTokenUsageInMetadata(50, 25);
+
+  auto manager = startDecode(R"({"model":"multi_fallback_model","messages":[]})",
+                             defaultConfig(/*with_db=*/true));
+
+  EXPECT_CALL(*mock_db_, recordQueryStats(stream_info_.startTime(), 50, 25, "claude-sonnet-4-5",
+                                          "primary_anthropic", "test-req-id"));
+
+  const std::string unary_payload = R"({"id":"msg_1","model":"claude-sonnet-4-5","content":"ok"})";
+  EXPECT_EQ(nlohmann::json::parse(runUnaryResponse(*manager, unary_payload)),
+            nlohmann::json::parse(unary_payload));
+}
+
+TEST_F(ModelRouterFilterTest, SkipsDatabaseRecordWhenExtractionFailed) {
+  setModelInFilterState("send_me_to_anthropic");
+  stream_info_.setAttemptCount(1);
+  setTokenUsageInMetadata(0, 0, envoy::data::ai::v3::TokenUsage::FAILED);
+
+  auto manager = startDecode(R"({"model":"send_me_to_anthropic","messages":[]})",
+                             defaultConfig(/*with_db=*/true));
+
+  const std::string unary_payload = R"({"id":"msg_1","model":"claude-haiku-4-5","content":"ok"})";
+  EXPECT_EQ(nlohmann::json::parse(runUnaryResponse(*manager, unary_payload)),
+            nlohmann::json::parse(unary_payload));
+}
+
+TEST_F(ModelRouterFilterTest, SkipsDatabaseRecordWhenTokenUsageMetadataMissing) {
+  setModelInFilterState("send_me_to_anthropic");
+  stream_info_.setAttemptCount(1);
+
+  auto manager = startDecode(R"({"model":"send_me_to_anthropic","messages":[]})",
+                             defaultConfig(/*with_db=*/true));
+
+  const std::string unary_payload = R"({"id":"msg_1","model":"claude-haiku-4-5","content":"ok"})";
+  EXPECT_EQ(nlohmann::json::parse(runUnaryResponse(*manager, unary_payload)),
+            nlohmann::json::parse(unary_payload));
+}
+
+TEST_F(ModelRouterFilterTest, SkipsDatabaseRecordWhenAttemptCountMissingOrOutOfBounds) {
+  setModelInFilterState("send_me_to_anthropic");
+  setTokenUsageInMetadata(10, 20);
+
+  // Missing attempt count: request never went upstream.
+  {
+    auto manager = startDecode(R"({"model":"send_me_to_anthropic","messages":[]})",
+                               defaultConfig(/*with_db=*/true));
+    const std::string unary_payload = R"({"id":"msg_1","content":"ok"})";
+    EXPECT_EQ(nlohmann::json::parse(runUnaryResponse(*manager, unary_payload)),
+              nlohmann::json::parse(unary_payload));
+  }
+
+  // Out-of-bounds attempt count (2 > 1 configured target).
+  {
+    stream_info_.setAttemptCount(2);
+    auto manager = startDecode(R"({"model":"send_me_to_anthropic","messages":[]})",
+                               defaultConfig(/*with_db=*/true));
+    const std::string unary_payload = R"({"id":"msg_1","content":"ok"})";
+    EXPECT_EQ(nlohmann::json::parse(runUnaryResponse(*manager, unary_payload)),
+              nlohmann::json::parse(unary_payload));
+  }
+}
+
+TEST_F(ModelRouterFilterTest, SkipsDatabaseRecordWhenRouteNotFound) {
+  setModelInFilterState("unknown_model");
+  stream_info_.setAttemptCount(1);
+  setTokenUsageInMetadata(10, 20);
+
+  auto manager =
+      startDecode(R"({"model":"unknown_model","messages":[]})", defaultConfig(/*with_db=*/true));
+
+  const std::string unary_payload = R"({"id":"msg_1","content":"ok"})";
+  EXPECT_EQ(nlohmann::json::parse(runUnaryResponse(*manager, unary_payload)),
+            nlohmann::json::parse(unary_payload));
+}
+
+TEST_F(ModelRouterFilterTest, DatabaseFailureDoesNotFailResponse) {
+  setModelInFilterState("send_me_to_anthropic");
+  stream_info_.setAttemptCount(1);
+  setTokenUsageInMetadata(100, 50);
+
+  auto manager = startDecode(R"({"model":"send_me_to_anthropic","messages":[]})",
+                             defaultConfig(/*with_db=*/true));
+
+  EXPECT_CALL(*mock_db_, recordQueryStats(stream_info_.startTime(), 100, 50, "claude-haiku-4-5",
+                                          "anthropic", "test-req-id"))
+      .WillOnce([](Envoy::SystemTime, uint64_t, uint64_t, std::string, std::string, std::string) {
+        return MockDatabase::makeStatusTask(absl::UnavailableError("database unavailable"));
+      });
+
+  const std::string sse_payload = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"
+                                  "data: [DONE]\n\n";
+  EXPECT_EQ(runSseResponse(*manager, sse_payload), sse_payload);
 }
 
 } // namespace

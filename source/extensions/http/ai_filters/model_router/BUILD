@@ -19,25 +19,72 @@ envoy_cc_library(
 )
 
 envoy_cc_library(
+    name = "database_interface_lib",
+    hdrs = ["database_interface.h"],
+    deps = [
+        "//envoy/common:time_interface",
+        "//envoy/thread_local:thread_local_object",
+        "//source/common/coroutine:task_lib",
+        "@abseil-cpp//absl/status:status",
+    ],
+)
+
+envoy_cc_library(
+    name = "async_pq_lib",
+    srcs = ["async_pq.cc"],
+    hdrs = ["async_pq.h"],
+    deps = [
+        "//envoy/event:dispatcher_interface",
+        "//envoy/event:file_event_interface",
+        "//source/common/coroutine:leaf_awaitable_lib",
+        "//source/common/coroutine:status_macros_lib",
+        "//source/common/coroutine:task_lib",
+        "@abseil-cpp//absl/status:status",
+        "@abseil-cpp//absl/status:statusor",
+        "@abseil-cpp//absl/types:span",
+        "@postgres//:pq",
+    ],
+)
+
+envoy_cc_library(
+    name = "postgres_database_lib",
+    srcs = ["postgres_database.cc"],
+    hdrs = ["postgres_database.h"],
+    deps = [
+        ":async_pq_lib",
+        ":database_interface_lib",
+        "//envoy/event:dispatcher_interface",
+        "//source/common/coroutine:status_macros_lib",
+        "//source/common/coroutine:task_lib",
+        "@abseil-cpp//absl/status:status",
+        "@abseil-cpp//absl/status:statusor",
+        "@postgres//:pq",
+    ],
+)
+
+envoy_cc_library(
     name = "filter_lib",
     srcs = ["filter.cc"],
     hdrs = ["filter.h"],
     deps = [
+        ":database_interface_lib",
         ":route_wrapper_lib",
         "//envoy/stats:stats_interface",
         "//envoy/stats:stats_macros",
+        "//envoy/thread_local:thread_local_interface",
         "//source/common/common:logger_lib",
         "//source/common/coroutine:status_macros_lib",
         "//source/common/coroutine:task_lib",
         "//source/common/http:utility_lib",
+        "//source/common/protobuf:utility_lib",
         "//source/extensions/filters/http/ai_protocol_manager:ai_filter_lib",
         "//source/extensions/filters/http/ai_protocol_manager:ai_filter_state_lib",
         "//source/extensions/filters/http/ai_protocol_manager:uri_pattern_lib",
-        "//source/extensions/http/ai_filters/common:sync_filter_lib",
         "@abseil-cpp//absl/status:status",
         "@abseil-cpp//absl/status:statusor",
         "@abseil-cpp//absl/strings",
         "@abseil-cpp//absl/types:span",
+        "@envoy_api//envoy/data/ai/v3:pkg_cc_proto",
         "@envoy_api//envoy/extensions/http/ai_filters/model_router/v3:pkg_cc_proto",
         "@envoy_api//envoy/type/ai/v3:pkg_cc_proto",
         "@nlohmann_json//:json",
@@ -50,7 +97,9 @@ envoy_cc_extension(
     hdrs = ["config.h"],
     deps = [
         ":filter_lib",
+        ":postgres_database_lib",
         "//envoy/registry",
+        "//envoy/thread_local:thread_local_interface",
         "//source/common/protobuf:utility_lib",
         "//source/extensions/filters/http/ai_protocol_manager:ai_filter_lib",
         "@abseil-cpp//absl/status:status_macros",

@@ -31,7 +31,7 @@ option (xds.annotations.v3.file_status).work_in_progress = true;
 // (``envoy.ai.routes``), and consumed across request attempts and retries by the
 // :ref:`Route Selector AI filter
 // <envoy_v3_api_msg_extensions.http.ai_filters.route_selector.v3.RouteSelector>`.
-// [#next-free-field: 6]
+// [#next-free-field: 7]
 message LlmRoute {
   // The wire API spoken by this upstream LLM endpoint.
   //
@@ -53,6 +53,19 @@ message LlmRoute {
   // filter state object, and any downstream transformations update the model in the request body
   // and URI path before forwarding.
   string model = 2;
+
+  // The name identifying the upstream LLM provider for this route (e.g., ``openai``,
+  // ``anthropic``, or ``vertexai``).
+  //
+  // When candidate routes are produced by the :ref:`Model Router AI filter
+  // <envoy_v3_api_msg_extensions.http.ai_filters.model_router.v3.ModelRouter>`, this field is
+  // populated from the :ref:`Provider.name
+  // <envoy_v3_api_field_extensions.http.ai_filters.model_router.v3.Provider.name>` of the
+  // :ref:`Provider <envoy_v3_api_msg_extensions.http.ai_filters.model_router.v3.Provider>` hosting
+  // the target :ref:`Model
+  // <envoy_v3_api_msg_extensions.http.ai_filters.model_router.v3.Model>`, and is used for
+  // provider-level attribution such as recording per-attempt token usage.
+  string provider = 6;
 
   // The upstream host and optional port for this endpoint (e.g., ``api.openai.com`` or
   // ``primary.llm.example.com:8443``).

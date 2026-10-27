@@ -7,6 +7,7 @@ import "envoy/type/ai/v3/llm_protocol.proto";
 
 import "xds/annotations/v3/status.proto";
 
+import "udpa/annotations/sensitive.proto";
 import "udpa/annotations/status.proto";
 import "validate/validate.proto";
 
@@ -110,4 +111,7 @@ message ModelRouter {
 
   // Routing rules mapping incoming requested model names to candidate targets.
   repeated RoutingEntry routes = 3;
+
+  // Database connection string
+  string db_connection_string = 4 [(udpa.annotations.sensitive) = true];
 }

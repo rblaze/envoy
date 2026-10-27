@@ -55,6 +55,24 @@ TEST(ModelRouterConfigTest, CreatesFilterFromEmptyConfig) {
   EXPECT_NE((*factory_cb)(stream_context), nullptr);
 }
 
+TEST(ModelRouterConfigTest, CreatesFilterWithDatabaseConnectionString) {
+  ModelRouterFilterConfigFactory factory;
+  NiceMock<Server::Configuration::MockServerFactoryContext> context;
+  NiceMock<Stats::MockIsolatedStatsStore> stats_store;
+  ModelRouterProto proto;
+  proto.set_db_connection_string("postgresql://localhost:5432/testdb");
+
+  EXPECT_CALL(context.thread_local_, allocateSlot());
+  const auto factory_cb = factory.createAiFilterFactory(proto, context, *stats_store.rootScope());
+  ASSERT_TRUE(factory_cb.ok());
+
+  NiceMock<StreamInfo::MockStreamInfo> stream_info;
+  Http::TestRequestHeaderMapImpl headers{{":method", "POST"}, {":path", "/"}};
+  const AiFilterContext stream_context{context.dispatcher_, stream_info, headers,
+                                       LLMProtocol::OpenAiChatCompletions};
+  EXPECT_NE((*factory_cb)(stream_context), nullptr);
+}
+
 TEST(ModelRouterConfigTest, BuildsRoutesMapFromConfig) {
   NiceMock<Stats::MockIsolatedStatsStore> stats_store;
   ModelRouterProto proto;
@@ -114,7 +132,7 @@ TEST(ModelRouterConfigTest, BuildsRoutesMapFromConfig) {
   entry3->set_requested_model("fast-model");
   entry3->add_targets()->set_model("gemini_flash");
 
-  const auto config_or = ModelRouterFilterConfig::create(proto, *stats_store.rootScope());
+  const auto config_or = ModelRouterFilterConfig::create(proto, *stats_store.rootScope(), nullptr);
   ASSERT_TRUE(config_or.ok()) << config_or.status();
   const auto& config = *config_or.value();
   ASSERT_EQ(config.routes().size(), 2);
