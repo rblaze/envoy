@@ -123,6 +123,7 @@ TEST(ModelRouterConfigTest, BuildsRoutesMapFromConfig) {
   ASSERT_EQ(fast_it->second.routes_size(), 3);
   EXPECT_EQ(fast_it->second.routes(0).llm_protocol(), envoy::type::ai::v3::ANTHROPIC_MESSAGES);
   EXPECT_EQ(fast_it->second.routes(0).model(), "claude-haiku-4-5");
+  EXPECT_EQ(fast_it->second.routes(0).provider(), "anthropic");
   EXPECT_EQ(fast_it->second.routes(0).host_and_port(), "api.anthropic.com");
   EXPECT_EQ(fast_it->second.routes(0).api_key(), "Bearer sk-ant");
   ASSERT_TRUE(fast_it->second.routes(0).has_binding());
@@ -130,12 +131,14 @@ TEST(ModelRouterConfigTest, BuildsRoutesMapFromConfig) {
 
   EXPECT_EQ(fast_it->second.routes(1).llm_protocol(), envoy::type::ai::v3::OPENAI_CHAT_COMPLETIONS);
   EXPECT_EQ(fast_it->second.routes(1).model(), "gpt-4o-mini");
+  EXPECT_EQ(fast_it->second.routes(1).provider(), "openai");
   EXPECT_EQ(fast_it->second.routes(1).host_and_port(), "api.openai.com:443");
   EXPECT_EQ(fast_it->second.routes(1).api_key(), "Bearer sk-oai");
   EXPECT_FALSE(fast_it->second.routes(1).has_binding());
 
   EXPECT_EQ(fast_it->second.routes(2).llm_protocol(), envoy::type::ai::v3::GEMINI_GENERATE_CONTENT);
   EXPECT_EQ(fast_it->second.routes(2).model(), "gemini-2.5-flash");
+  EXPECT_EQ(fast_it->second.routes(2).provider(), "gemini");
   EXPECT_EQ(fast_it->second.routes(2).host_and_port(), "generativelanguage.googleapis.com");
   EXPECT_TRUE(fast_it->second.routes(2).api_key().empty());
   ASSERT_TRUE(fast_it->second.routes(2).has_binding());
@@ -148,6 +151,7 @@ TEST(ModelRouterConfigTest, BuildsRoutesMapFromConfig) {
   EXPECT_EQ(reasoning_it->second.routes(0).llm_protocol(),
             envoy::type::ai::v3::GEMINI_GENERATE_CONTENT);
   EXPECT_EQ(reasoning_it->second.routes(0).model(), "gemini-2.5-pro");
+  EXPECT_EQ(reasoning_it->second.routes(0).provider(), "gemini");
   EXPECT_EQ(reasoning_it->second.routes(0).host_and_port(), "generativelanguage.googleapis.com");
   EXPECT_EQ(reasoning_it->second.routes(0).api_key(), "Bearer g-pro");
   ASSERT_TRUE(reasoning_it->second.routes(0).has_binding());
@@ -207,6 +211,95 @@ TEST(ModelRouterConfigTest, RejectsInvalidLlmProtocolEnum) {
   EXPECT_THROW_WITH_REGEX(
       factory.createAiFilterFactory(proto, context, *stats_store.rootScope()).IgnoreError(),
       EnvoyException, "value must be one of the defined enum values");
+}
+
+TEST(ModelRouterConfigTest, AcceptsValidQuotasIncludingZeroLimit) {
+  ModelRouterFilterConfigFactory factory;
+  NiceMock<Server::Configuration::MockServerFactoryContext> context;
+  NiceMock<Stats::MockIsolatedStatsStore> stats_store;
+  ModelRouterProto proto;
+
+  auto* provider = proto.add_providers();
+  provider->set_name("openai");
+  provider->set_llm_protocol(envoy::type::ai::v3::OPENAI_CHAT_COMPLETIONS);
+  provider->set_host_and_port("api.openai.com");
+
+  auto* model = proto.add_models();
+  model->set_name("gpt4o");
+  model->set_provider("openai");
+  model->set_model("gpt-4o");
+
+  auto* q1 = model->add_quotas();
+  q1->set_quota_type(envoy::extensions::http::ai_filters::model_router::v3::REQUESTS);
+  q1->set_time_unit(envoy::extensions::http::ai_filters::model_router::v3::MINUTE);
+  q1->set_limit(0);
+
+  auto* q2 = model->add_quotas();
+  q2->set_quota_type(envoy::extensions::http::ai_filters::model_router::v3::TOKENS);
+  q2->set_time_unit(envoy::extensions::http::ai_filters::model_router::v3::HOUR);
+  q2->set_limit(10000);
+
+  auto* q3 = model->add_quotas();
+  q3->set_quota_type(envoy::extensions::http::ai_filters::model_router::v3::REQUESTS);
+  q3->set_time_unit(envoy::extensions::http::ai_filters::model_router::v3::DAY);
+  q3->set_limit(500);
+
+  auto* entry = proto.add_routes();
+  entry->set_requested_model("chat");
+  entry->add_targets()->set_model("gpt4o");
+
+  const auto factory_cb = factory.createAiFilterFactory(proto, context, *stats_store.rootScope());
+  ASSERT_TRUE(factory_cb.ok()) << factory_cb.status();
+}
+
+TEST(ModelRouterConfigTest, RejectsInvalidQuotaTypeOrTimeUnit) {
+  ModelRouterFilterConfigFactory factory;
+  NiceMock<Server::Configuration::MockServerFactoryContext> context;
+  NiceMock<Stats::MockIsolatedStatsStore> stats_store;
+
+  {
+    ModelRouterProto proto;
+    auto* model = proto.add_models();
+    model->set_name("haiku");
+    model->set_provider("anthropic");
+    model->set_model("claude-haiku-4-5");
+    auto* quota = model->add_quotas();
+    quota->set_quota_type(envoy::extensions::http::ai_filters::model_router::v3::QUOTA_UNSPECIFIED);
+    quota->set_time_unit(envoy::extensions::http::ai_filters::model_router::v3::MINUTE);
+    quota->set_limit(10);
+
+    EXPECT_THROW_WITH_REGEX(
+        factory.createAiFilterFactory(proto, context, *stats_store.rootScope()).IgnoreError(),
+        EnvoyException, "QuotaValidationError\\.QuotaType");
+
+    const auto config_or = ModelRouterFilterConfig::create(proto, *stats_store.rootScope());
+    ASSERT_FALSE(config_or.ok());
+    EXPECT_EQ(config_or.status().code(), absl::StatusCode::kInvalidArgument);
+    EXPECT_THAT(std::string(config_or.status().message()),
+                testing::HasSubstr("Invalid quota type for model haiku"));
+  }
+
+  {
+    ModelRouterProto proto;
+    auto* model = proto.add_models();
+    model->set_name("haiku");
+    model->set_provider("anthropic");
+    model->set_model("claude-haiku-4-5");
+    auto* quota = model->add_quotas();
+    quota->set_quota_type(envoy::extensions::http::ai_filters::model_router::v3::REQUESTS);
+    quota->set_time_unit(envoy::extensions::http::ai_filters::model_router::v3::TIME_UNSPECIFIED);
+    quota->set_limit(10);
+
+    EXPECT_THROW_WITH_REGEX(
+        factory.createAiFilterFactory(proto, context, *stats_store.rootScope()).IgnoreError(),
+        EnvoyException, "QuotaValidationError\\.TimeUnit");
+
+    const auto config_or = ModelRouterFilterConfig::create(proto, *stats_store.rootScope());
+    ASSERT_FALSE(config_or.ok());
+    EXPECT_EQ(config_or.status().code(), absl::StatusCode::kInvalidArgument);
+    EXPECT_THAT(std::string(config_or.status().message()),
+                testing::HasSubstr("Invalid quota time unit for model haiku"));
+  }
 }
 
 } // namespace
