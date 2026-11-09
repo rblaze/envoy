@@ -116,3 +116,12 @@ message LocalReplyDuringHostSelectionConfig {
 }
 message StatsPrefixFilterConfig {
 }
+
+// Configs for the test filters defined in upstream_http_filter_integration_test.cc. Each filter
+// has its own config type, since filter factories are looked up by config type URL.
+message DownstreamResponseModifyingFilterConfig {
+}
+message UpstreamResponseModifyingFilterConfig {
+}
+message UpstreamConfigurableLocalReplyFilterConfig {
+}
