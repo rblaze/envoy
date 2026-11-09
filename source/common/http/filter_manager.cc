@@ -1064,7 +1064,12 @@ FilterManager::commonDecodePrefix(ActiveStreamDecoderFilter* filter,
   return std::next(filter->entry());
 }
 
-void DownstreamFilterManager::onLocalReply(StreamFilterBase::LocalReplyData& data) {
+void FilterManager::rewriteLocalReply(ResponseHeaderMap& response_headers, Code& code,
+                                      std::string& /*body*/, absl::string_view& /*content_type*/) {
+  response_headers.setStatus(std::to_string(enumToInt(code)));
+}
+
+void FilterManager::onLocalReply(StreamFilterBase::LocalReplyData& data) {
   state_.under_on_local_reply_ = true;
   filter_manager_callbacks_.onLocalReply(data.code_);
 
@@ -1076,7 +1081,7 @@ void DownstreamFilterManager::onLocalReply(StreamFilterBase::LocalReplyData& dat
   state_.under_on_local_reply_ = false;
 }
 
-void DownstreamFilterManager::sendLocalReply(
+void FilterManager::sendLocalReply(
     Code code, absl::string_view body,
     const std::function<void(ResponseHeaderMap& headers)>& modify_headers,
     const std::optional<Grpc::Status::GrpcStatus> grpc_status, absl::string_view details) {
@@ -1095,12 +1100,10 @@ void DownstreamFilterManager::sendLocalReply(
   if (filter_manager_callbacks_.isHalfCloseEnabled()) {
     state_.decoder_filter_chain_aborted_ = true;
   }
-  // For early error handling, do a best-effort attempt to create a filter chain
-  // to ensure access logging. If the filter chain already exists this will be
-  // a no-op.
-  createDownstreamFilterChain();
 
-  streamInfo().setResponseCodeDetails(details);
+  onBeforeLocalReply();
+
+  setLocalReplyResponseCodeDetails(details);
   StreamFilterBase::LocalReplyData data{code, grpc_status, details, false, body};
   onLocalReply(data);
   if (data.reset_imminent_) {
@@ -1110,7 +1113,8 @@ void DownstreamFilterManager::sendLocalReply(
     return;
   }
 
-  if (!filter_manager_callbacks_.responseHeaders().has_value() &&
+  if (!state_.non_100_response_headers_encoded_ &&
+      !filter_manager_callbacks_.responseHeaders().has_value() &&
       (!filter_manager_callbacks_.informationalHeaders().has_value() ||
        !(state_.filter_call_state_ & FilterCallState::IsEncodingMask))) {
     // If the response has not started at all, or if the only response so far is an informational
@@ -1147,7 +1151,7 @@ void DownstreamFilterManager::sendLocalReply(
     // state machine screwed up, bypass the filter chain and send the local
     // reply directly to the codec.
     //
-    sendDirectLocalReply(code, body, modify_headers, state_.is_head_request_, grpc_status);
+    sendDirectLocalReply(code, body, modify_headers, is_head_request, grpc_status);
   } else {
     // If we land in this branch, response headers have already been sent to the client.
     // All we can do at this point is reset the stream.
@@ -1159,7 +1163,7 @@ void DownstreamFilterManager::sendLocalReply(
   }
 }
 
-void DownstreamFilterManager::prepareLocalReplyViaFilterChain(
+void FilterManager::prepareLocalReplyViaFilterChain(
     bool is_grpc_request, Code code, absl::string_view body,
     const std::function<void(ResponseHeaderMap& headers)>& modify_headers, bool is_head_request,
     const std::optional<Grpc::Status::GrpcStatus> grpc_status, absl::string_view details) {
@@ -1173,15 +1177,14 @@ void DownstreamFilterManager::prepareLocalReplyViaFilterChain(
   prepared_local_reply_ = Utility::prepareLocalReply(
       Utility::EncodeFunctions{
           [this, modify_headers](ResponseHeaderMap& headers) -> void {
-            finalizeHeaders(filter_manager_callbacks_, streamInfo(), headers);
+            finalizeLocalReplyHeaders(headers);
             if (modify_headers) {
               modify_headers(headers);
             }
           },
           [this](ResponseHeaderMap& response_headers, Code& code, std::string& body,
                  absl::string_view& content_type) -> void {
-            local_reply_.rewrite(filter_manager_callbacks_.requestHeaders().ptr(), response_headers,
-                                 streamInfo(), code, body, content_type);
+            rewriteLocalReply(response_headers, code, body, content_type);
           },
           [this](ResponseHeaderMapPtr&& headers, bool end_stream) -> void {
             filter_manager_callbacks_.setResponseHeaders(std::move(headers));
@@ -1194,7 +1197,7 @@ void DownstreamFilterManager::prepareLocalReplyViaFilterChain(
       Utility::LocalReplyData{is_grpc_request, code, body, grpc_status, is_head_request});
 }
 
-void DownstreamFilterManager::executeLocalReplyIfPrepared() {
+void FilterManager::executeLocalReplyIfPrepared() {
   if (!prepared_local_reply_) {
     return;
   }
@@ -1207,7 +1210,18 @@ FilterManager::CreateChainResult DownstreamFilterManager::createDownstreamFilter
   return createFilterChain(filter_chain_factory_);
 }
 
-void DownstreamFilterManager::sendLocalReplyViaFilterChain(
+void DownstreamFilterManager::finalizeLocalReplyHeaders(ResponseHeaderMap& headers) {
+  finalizeHeaders(filter_manager_callbacks_, streamInfo(), headers);
+}
+
+void DownstreamFilterManager::rewriteLocalReply(ResponseHeaderMap& response_headers, Code& code,
+                                                std::string& body,
+                                                absl::string_view& content_type) {
+  local_reply_.rewrite(filter_manager_callbacks_.requestHeaders().ptr(), response_headers,
+                       streamInfo(), code, body, content_type);
+}
+
+void FilterManager::sendLocalReplyViaFilterChain(
     bool is_grpc_request, Code code, absl::string_view body,
     const std::function<void(ResponseHeaderMap& headers)>& modify_headers, bool is_head_request,
     const std::optional<Grpc::Status::GrpcStatus> grpc_status, absl::string_view details) {
@@ -1218,15 +1232,14 @@ void DownstreamFilterManager::sendLocalReplyViaFilterChain(
       state_.destroyed_,
       Utility::EncodeFunctions{
           [this, modify_headers](ResponseHeaderMap& headers) -> void {
-            finalizeHeaders(filter_manager_callbacks_, streamInfo(), headers);
+            finalizeLocalReplyHeaders(headers);
             if (modify_headers) {
               modify_headers(headers);
             }
           },
           [this](ResponseHeaderMap& response_headers, Code& code, std::string& body,
                  absl::string_view& content_type) -> void {
-            local_reply_.rewrite(filter_manager_callbacks_.requestHeaders().ptr(), response_headers,
-                                 streamInfo(), code, body, content_type);
+            rewriteLocalReply(response_headers, code, body, content_type);
           },
           [this](ResponseHeaderMapPtr&& headers, bool end_stream) -> void {
             filter_manager_callbacks_.setResponseHeaders(std::move(headers));
@@ -1239,7 +1252,7 @@ void DownstreamFilterManager::sendLocalReplyViaFilterChain(
       Utility::LocalReplyData{is_grpc_request, code, body, grpc_status, is_head_request});
 }
 
-void DownstreamFilterManager::sendDirectLocalReply(
+void FilterManager::sendDirectLocalReply(
     Code code, absl::string_view body,
     const std::function<void(ResponseHeaderMap&)>& modify_headers, bool is_head_request,
     const std::optional<Grpc::Status::GrpcStatus> grpc_status) {
@@ -1263,15 +1276,14 @@ void DownstreamFilterManager::sendDirectLocalReply(
       state_.destroyed_,
       Utility::EncodeFunctions{
           [this, modify_headers](ResponseHeaderMap& headers) -> void {
-            finalizeHeaders(filter_manager_callbacks_, streamInfo(), headers);
+            finalizeLocalReplyHeaders(headers);
             if (modify_headers) {
               modify_headers(headers);
             }
           },
           [&](ResponseHeaderMap& response_headers, Code& code, std::string& body,
               absl::string_view& content_type) -> void {
-            local_reply_.rewrite(filter_manager_callbacks_.requestHeaders().ptr(), response_headers,
-                                 streamInfo(), code, body, content_type);
+            rewriteLocalReply(response_headers, code, body, content_type);
           },
           [&](ResponseHeaderMapPtr&& response_headers, bool end_stream) -> void {
             // Move the response headers into the FilterManager to make sure they're visible to
