@@ -936,6 +936,7 @@ envoy_cc_test(
     deps = [
         ":http_integration_lib",
         ":integration_lib",
+        "//source/extensions/filters/http/common:pass_through_filter_lib",
         "//test/integration/filters:add_header_filter_config_lib",
         "//test/integration/filters:add_header_filter_proto_cc_proto",
         "//test/integration/filters:async_upstream_filter_lib",
