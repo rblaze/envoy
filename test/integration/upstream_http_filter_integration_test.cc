@@ -288,8 +288,8 @@ TEST_P(StaticRouterOrClusterFiltersIntegrationTest, OnHostSelectedLocalReply) {
   cleanupUpstreamAndDownstream();
 }
 
-// Verify that a local reply sent from onHostSelected is not retried, even when the route has a
-// retry policy that would normally retry on 4xx responses.
+// Verify that a local reply sent from onHostSelected is not retried when the route retry policy
+// does not match the local reply status code.
 TEST_P(StaticRouterOrClusterFiltersIntegrationTest, OnHostSelectedLocalReplyNoRetry) {
   config_helper_.addConfigModifier(
       [](envoy::extensions::filters::network::http_connection_manager::v3::HttpConnectionManager&
@@ -299,7 +299,7 @@ TEST_P(StaticRouterOrClusterFiltersIntegrationTest, OnHostSelectedLocalReplyNoRe
                                  ->mutable_routes(0)
                                  ->mutable_route()
                                  ->mutable_retry_policy();
-        retry_policy->set_retry_on("4xx");
+        retry_policy->set_retry_on("5xx");
         retry_policy->mutable_num_retries()->set_value(3);
       });
 
@@ -313,6 +313,7 @@ TEST_P(StaticRouterOrClusterFiltersIntegrationTest, OnHostSelectedLocalReplyNoRe
   EXPECT_TRUE(response->waitForEndStream());
   EXPECT_TRUE(response->complete());
   EXPECT_EQ("403", response->headers().getStatusValue());
+  EXPECT_EQ(0UL, test_server_->counter("cluster.cluster_0.upstream_rq_retry")->value());
 
   // No upstream connection was ever initiated — newStream() was never called on any attempt.
   auto upstream_headers =
