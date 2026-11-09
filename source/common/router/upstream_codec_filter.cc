@@ -38,12 +38,21 @@ UpstreamCodecFilter::ScopedEncodingTracker::~ScopedEncodingTracker() {
   filter_->calling_encode_ = false;
 }
 
+// Upstream HTTP filter local replies reset the upstream stream before the local reply is encoded
+// back through the upstream filter chain, so the watermark callbacks below may fire after the
+// upstream has been cleared.
 void UpstreamCodecFilter::onBelowWriteBufferLowWatermark() {
+  if (!callbacks_->upstreamCallbacks()->upstream()) {
+    return;
+  }
   callbacks_->clusterInfo()->trafficStats()->upstream_flow_control_resumed_reading_total_.inc();
   callbacks_->upstreamCallbacks()->upstream()->readDisable(false);
 }
 
 void UpstreamCodecFilter::onAboveWriteBufferHighWatermark() {
+  if (!callbacks_->upstreamCallbacks()->upstream()) {
+    return;
+  }
   callbacks_->clusterInfo()->trafficStats()->upstream_flow_control_paused_reading_total_.inc();
   callbacks_->upstreamCallbacks()->upstream()->readDisable(true);
 }

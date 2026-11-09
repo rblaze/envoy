@@ -603,6 +603,12 @@ private:
   bool maybeRetryReset(Http::StreamResetReason reset_reason, UpstreamRequest& upstream_request,
                        TimeoutRetry is_timeout_retry);
   uint32_t numRequestsAwaitingHeaders();
+  // Returns true if the downstream response has started and no upstream request is left. This is
+  // the state after an upstream HTTP filter local reply that is not retried completes the response
+  // while the request is still being decoded. There is nothing left to proxy the request to.
+  bool responseCompletedWithoutUpstreamRequest() const {
+    return downstream_response_started_ && upstream_requests_.empty();
+  }
   void onGlobalTimeout();
   void onRequestComplete();
   void onResponseTimeout();

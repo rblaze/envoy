@@ -59,19 +59,41 @@ public:
   const StreamInfo::StreamInfo& streamInfo() const override {
     return upstream_request_.parent_.callbacks()->streamInfo();
   }
-  // Send local replies via the downstream HTTP filter manager.
-  // Local replies will not be seen by upstream HTTP filters.
+  // Route local replies through the upstream HTTP encoder filter chain and then to the router,
+  // which handles them like an upstream response (retries included, see sentLocalReply()).
+  // When the `envoy.reloadable_features.upstream_filter_local_reply_via_upstream_filter_chain`
+  // runtime guard is disabled, local replies are sent via the downstream HTTP filter manager
+  // instead and are not seen by upstream HTTP filters.
   void sendLocalReply(Http::Code code, absl::string_view body,
                       const std::function<void(Http::ResponseHeaderMap& headers)>& modify_headers,
                       const std::optional<Grpc::Status::GrpcStatus> grpc_status,
                       absl::string_view details) override {
     state().decoder_filter_chain_aborted_ = true;
-    state().encoder_filter_chain_aborted_ = true;
-    state().encoder_filter_chain_complete_ = true;
-    state().observed_encode_end_stream_ = true;
-    // TODO(alyssawilk) this should be done through the router to play well with hedging.
-    upstream_request_.parent_.callbacks()->sendLocalReply(code, body, modify_headers, grpc_status,
-                                                          details);
+    if (!Runtime::runtimeFeatureEnabled(
+            "envoy.reloadable_features.upstream_filter_local_reply_via_upstream_filter_chain")) {
+      state().encoder_filter_chain_aborted_ = true;
+      state().encoder_filter_chain_complete_ = true;
+      state().observed_encode_end_stream_ = true;
+      upstream_request_.parent_.callbacks()->sendLocalReply(code, body, modify_headers, grpc_status,
+                                                            details);
+      return;
+    }
+    if (state().destroyed_) {
+      // A filter must not send a local reply after onDestroy(), for example from a timer that it
+      // did not cancel. The upstream request may already be gone from the router, so drop it.
+      return;
+    }
+    upstream_request_.sent_local_reply_ = true;
+    // The router handles the local reply like an upstream response and expects a host. If no host
+    // has been selected yet, attribute the reply to the connection pool's host. `pool_success` is
+    // false so that only retry_state_->onHostAttempted() runs: retry host predicates (for example
+    // previous_hosts) see the host, but the host is not recorded with addUpstreamHostAttempted()
+    // and the virtual cluster upstream_rq_total stat is not incremented.
+    if (!upstream_request_.upstream_host_) {
+      upstream_request_.onUpstreamHostSelected(upstream_request_.conn_pool_->host(),
+                                               /*pool_success=*/false);
+    }
+    Http::FilterManager::sendLocalReply(code, body, modify_headers, grpc_status, details);
   }
   // Returns true if the decoder filter chain should stop (local reply sent or downstream reset).
   bool isAborted() {
@@ -85,14 +107,31 @@ public:
     Upstream::HostDescriptionConstSharedPtr host = upstream_request_.conn_pool_->host();
     ASSERT(host != nullptr);
     for (auto* callback : upstream_request_.upstream_callbacks_) {
+      // Treat onHostSelected() like a decoder callback, so that a local reply sent from it is
+      // prepared and only encoded once the callback returns. Encoding the reply can complete or
+      // retry the upstream request and destroy the filters, which must not happen while the
+      // filter's onHostSelected() is still running.
+      ASSERT(!(state().filter_call_state_ & Http::FilterManager::FilterCallState::DecodeHeaders));
+      state().filter_call_state_ |= Http::FilterManager::FilterCallState::DecodeHeaders;
       callback->onHostSelected(host);
+      state().filter_call_state_ &= ~Http::FilterManager::FilterCallState::DecodeHeaders;
       if (isAborted()) {
+        executeLocalReplyIfPrepared();
         return true;
       }
     }
     return false;
   }
   UpstreamRequest& upstream_request_;
+
+protected:
+  // Upstream filter local replies record their response code details on the upstream stream info
+  // only. They are copied to the downstream stream info when the router forwards the reply, or by
+  // UpstreamRequestFilterManagerCallbacks::resetStream() when the reply resets the stream instead.
+  // That way a local reply that is retried does not leave stale details on the downstream stream.
+  void setLocalReplyResponseCodeDetails(absl::string_view details) override {
+    upstream_request_.streamInfo().setResponseCodeDetails(details);
+  }
 };
 
 UpstreamRequest::UpstreamRequest(RouterFilterInterface& parent,
@@ -302,7 +341,11 @@ void UpstreamRequest::decodeHeaders(Http::ResponseHeaderMapPtr&& headers, bool e
 
   resetPerTryIdleTimer();
 
-  addResponseHeadersStat(headers->byteSize(), headers->size());
+  // An upstream filter local reply was generated by Envoy, so it is not counted in the upstream
+  // response size stats.
+  if (!sent_local_reply_) {
+    addResponseHeadersStat(headers->byteSize(), headers->size());
+  }
 
   // We drop unsupported 1xx on the floor here. 101 upgrade headers need to be passed to the client
   // as part of the final response. Most 1xx headers are handled in onUpstream1xxHeaders.
@@ -337,6 +380,11 @@ void UpstreamRequest::decodeHeaders(Http::ResponseHeaderMapPtr&& headers, bool e
 }
 
 void UpstreamRequest::maybeHandleDeferredReadDisable() {
+  // The count can only be non-zero while there is an upstream: the downstream watermark callbacks
+  // that increment it are registered only while `upstream_` is set, and clearRequestEncoder()
+  // resets it when the upstream is released (for example before an upstream filter local reply is
+  // encoded).
+  ASSERT(upstream_ != nullptr || deferred_read_disabling_count_ == 0);
   for (; deferred_read_disabling_count_ > 0; --deferred_read_disabling_count_) {
     // If the deferred read disabling count hasn't been cancelled out by read
     // enabling count so far, stop the upstream from reading the rest response.
@@ -352,7 +400,10 @@ void UpstreamRequest::decodeData(Buffer::Instance& data, bool end_stream) {
   ScopeTrackerScopeState scope(&parent_.callbacks()->scope(), parent_.callbacks()->dispatcher());
 
   resetPerTryIdleTimer();
-  stream_info_.addBytesReceived(data.length());
+  // The body of an upstream filter local reply was not received from the upstream.
+  if (!sent_local_reply_) {
+    stream_info_.addBytesReceived(data.length());
+  }
   parent_.onUpstreamData(data, *this, end_stream);
 }
 
@@ -443,6 +494,9 @@ void UpstreamRequest::acceptHeadersFromRouter(bool end_stream) {
     paused_for_generic_upgrade_ = true;
   }
 
+  filter_manager_->requestHeadersInitialized();
+  filter_manager_->streamInfo().setRequestHeaders(*parent_.downstreamHeaders());
+
   // Kick off creation of the upstream connection immediately upon receiving headers. In future it
   // may be possible for upstream HTTP filters to delay this, or influence connection creation, but
   // for now optimize for minimal latency and fetch the connection as soon as possible. As a first
@@ -491,8 +545,6 @@ void UpstreamRequest::acceptHeadersFromRouter(bool end_stream) {
     resetUpstreamLogFlushTimer();
   }
 
-  filter_manager_->requestHeadersInitialized();
-  filter_manager_->streamInfo().setRequestHeaders(*parent_.downstreamHeaders());
   filter_manager_->decodeHeaders(*parent_.downstreamHeaders(), end_stream);
 }
 
@@ -784,6 +836,10 @@ void UpstreamRequest::clearRequestEncoder() {
   if (upstream_) {
     parent_.callbacks()->removeDownstreamWatermarkCallbacks(downstream_watermark_manager_);
   }
+  // Drop read disables deferred for the upstream being released. Response headers can still arrive
+  // afterwards from an upstream filter local reply, and must not call readDisable() on a null
+  // upstream.
+  deferred_read_disabling_count_ = 0;
   upstream_.reset();
 }
 
@@ -880,6 +936,15 @@ void UpstreamRequestFilterManagerCallbacks::resetStream(
   // send a local reply, or retry the stream.
   bool is_codec_error = absl::StrContains(transport_failure_reason, "codec_error");
   if (reset_reason == Http::StreamResetReason::LocalReset && !is_codec_error) {
+    // An upstream filter local reply resets the stream instead of reaching the router when the
+    // response has already started, or when a filter asks for a reset in onLocalReply(). The router
+    // would otherwise copy the local reply's details to the downstream stream, so do it here.
+    if (upstream_request_.sentLocalReply()) {
+      const auto& details = upstream_request_.streamInfo().responseCodeDetails();
+      if (details.has_value()) {
+        upstream_request_.parent_.callbacks()->streamInfo().setResponseCodeDetails(*details);
+      }
+    }
     upstream_request_.parent_.callbacks()->resetStream();
     return;
   }

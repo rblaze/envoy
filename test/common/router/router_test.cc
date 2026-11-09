@@ -373,6 +373,40 @@ TEST_F(RouterTest, MissingRequiredHeaders) {
   NiceMock<Http::MockRequestEncoder> encoder;
   Http::ResponseDecoder* response_decoder = nullptr;
   expectNewStreamWithImmediateEncoder(encoder, &response_decoder, Http::Protocol::Http10);
+  // The response completes synchronously while decoding headers, so no response timer is created.
+
+  Http::TestRequestHeaderMapImpl headers;
+  HttpTestUtility::addDefaultHeaders(headers);
+  headers.removeMethod();
+
+  EXPECT_CALL(encoder, encodeHeaders(_, _))
+      .WillOnce([](const Http::RequestHeaderMap& headers, bool) -> Http::Status {
+        return Http::HeaderUtility::checkRequiredRequestHeaders(headers);
+      });
+  // The upstream codec filter's local reply flows through the upstream filter chain and is
+  // forwarded to the downstream by the router like an upstream response.
+  EXPECT_CALL(callbacks_, sendLocalReply(_, _, _, _, _)).Times(0);
+  EXPECT_CALL(callbacks_, encodeHeaders_(_, false))
+      .WillOnce([](Http::ResponseHeaderMap& headers, bool) {
+        EXPECT_EQ("503", headers.getStatusValue());
+      });
+  EXPECT_CALL(callbacks_, encodeData(BufferString("missing required header: :method"), true));
+  router_->decodeHeaders(headers, true);
+  EXPECT_EQ("filter_removed_required_request_headers{missing_required_header:_:method}",
+            callbacks_.details());
+  router_->onDestroy();
+}
+
+// With the runtime guard disabled, the upstream codec filter's local reply goes straight to the
+// downstream filter manager, and the response timer is still created when the request completes.
+TEST_F(RouterTest, MissingRequiredHeadersUpstreamFilterLocalReplyViaFilterChainDisabled) {
+  TestScopedRuntime scoped_runtime;
+  scoped_runtime.mergeValues(
+      {{"envoy.reloadable_features.upstream_filter_local_reply_via_upstream_filter_chain",
+        "false"}});
+  NiceMock<Http::MockRequestEncoder> encoder;
+  Http::ResponseDecoder* response_decoder = nullptr;
+  expectNewStreamWithImmediateEncoder(encoder, &response_decoder, Http::Protocol::Http10);
   expectResponseTimerCreate();
 
   Http::TestRequestHeaderMapImpl headers;
@@ -388,6 +422,7 @@ TEST_F(RouterTest, MissingRequiredHeaders) {
       sendLocalReply(Http::Code::ServiceUnavailable, Eq("missing required header: :method"), _, _,
                      "filter_removed_required_request_headers{missing_required_header:_:method}"))
       .WillOnce([] {});
+  EXPECT_CALL(callbacks_, encodeHeaders_(_, _)).Times(0);
   router_->decodeHeaders(headers, true);
   router_->onDestroy();
 }
@@ -1769,13 +1804,22 @@ TEST_F(RouterTest, ResetDuringEncodeHeaders) {
   EXPECT_CALL(cm_.thread_local_cluster_.conn_pool_.host_->outlier_detector_,
               putResult(Upstream::Outlier::Result::LocalOriginConnectFailed, _))
       .Times(0);
-  // The reset will be converted into a local reply.
-  EXPECT_CALL(callbacks_, sendLocalReply(Http::Code::ServiceUnavailable, Eq(""), _, _,
-                                         "upstream_reset_before_response_started{remote_reset}"))
-      .WillOnce([] {});
+  // The reset will be converted into an upstream codec filter local reply, which flows through
+  // the upstream filter chain and is forwarded to the downstream by the router.
+  // The local reply did not come from the upstream host, so it is not reported to outlier
+  // detection.
+  EXPECT_CALL(cm_.thread_local_cluster_.conn_pool_.host_->outlier_detector_,
+              putResult(Upstream::Outlier::Result::ExtOriginRequestFailed, _))
+      .Times(0);
+  EXPECT_CALL(callbacks_, sendLocalReply(_, _, _, _, _)).Times(0);
+  EXPECT_CALL(callbacks_, encodeHeaders_(_, true))
+      .WillOnce([](Http::ResponseHeaderMap& headers, bool) {
+        EXPECT_EQ("503", headers.getStatusValue());
+      });
   router_->decodeHeaders(headers, true);
   EXPECT_EQ(1U,
             callbacks_.route_->virtual_host_->virtual_cluster_.stats().upstream_rq_total_.value());
+  EXPECT_EQ("upstream_reset_before_response_started{remote_reset}", callbacks_.details());
   router_->onDestroy();
 }
 
@@ -8009,8 +8053,11 @@ TEST_F(RouterTest, AutoHostRewriteEnabled) {
         return Http::okStatus();
       });
 
-  EXPECT_CALL(callbacks_, sendLocalReply(Http::Code::ServiceUnavailable, _, _, _, _)).WillOnce([] {
-  });
+  EXPECT_CALL(callbacks_, sendLocalReply(_, _, _, _, _)).Times(0);
+  EXPECT_CALL(callbacks_, encodeHeaders_(_, true))
+      .WillOnce([](Http::ResponseHeaderMap& headers, bool) {
+        EXPECT_EQ("503", headers.getStatusValue());
+      });
   EXPECT_CALL(callbacks_.route_->route_entry_, autoHostRewrite()).WillOnce(Return(true));
   EXPECT_CALL(callbacks_.route_->route_entry_, appendXfh()).WillOnce(Return(true));
   router_->decodeHeaders(incoming_headers, true);
