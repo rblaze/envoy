@@ -373,11 +373,52 @@ TEST_F(UpstreamRequestTest, OnHostSelectedRejectionViaSendLocalReply) {
   initialize();
 
   EXPECT_CALL(*conn_pool_, newStream(_)).Times(0);
-  EXPECT_CALL(router_filter_interface_.callbacks_,
-              sendLocalReply(Http::Code::Forbidden, _, _, _, _));
+  EXPECT_CALL(router_filter_interface_.callbacks_, sendLocalReply(_, _, _, _, _)).Times(0);
+  // The rejected host is reported to the router like a failed pool attempt, so that retry host
+  // predicates see it.
+  EXPECT_CALL(router_filter_interface_, onUpstreamHostSelected(_, false))
+      .WillOnce(Invoke([this](Upstream::HostDescriptionConstSharedPtr host, bool) {
+        EXPECT_EQ(host_.get(), host.get());
+      }));
+  EXPECT_CALL(router_filter_interface_, onUpstreamHeaders(403, _, _, false));
+  EXPECT_CALL(router_filter_interface_,
+              onUpstreamData(BufferString("Connection rejected"), _, true));
   upstream_request_->acceptHeadersFromRouter(false);
 
   EXPECT_TRUE(filter->on_host_selected_called_);
+  EXPECT_TRUE(upstream_request_->sentLocalReply());
+  EXPECT_EQ(upstream_request_->streamInfo().responseCodeDetails(), "upstream_filter_rejection");
+  EXPECT_EQ(upstream_request_->upstreamHost().ptr(), host_.get());
+}
+
+// With the runtime guard disabled, an upstream filter local reply goes straight to the downstream
+// filter manager, as before upstream filter local replies were routed through the upstream filter
+// chain.
+TEST_F(UpstreamRequestTest, OnHostSelectedRejectionWithRuntimeGuardDisabled) {
+  TestScopedRuntime scoped_runtime;
+  scoped_runtime.mergeValues(
+      {{"envoy.reloadable_features.upstream_filter_local_reply_via_upstream_filter_chain",
+        "false"}});
+  auto filter = std::make_shared<TestUpstreamFilter>();
+  filter->reject_connection_ = true;
+
+  EXPECT_CALL(*router_filter_interface_.cluster_info_, createFilterChain(_))
+      .WillOnce(Invoke([&](Http::FilterChainFactoryCallbacks& callbacks) -> bool {
+        callbacks.addStreamDecoderFilter(filter);
+        callbacks.addStreamDecoderFilter(std::make_shared<UpstreamCodecFilter>());
+        return true;
+      }));
+
+  initialize();
+
+  EXPECT_CALL(*conn_pool_, newStream(_)).Times(0);
+  EXPECT_CALL(router_filter_interface_.callbacks_,
+              sendLocalReply(Http::Code::Forbidden, _, _, _, "upstream_filter_rejection"));
+  EXPECT_CALL(router_filter_interface_, onUpstreamHeaders(_, _, _, _)).Times(0);
+  upstream_request_->acceptHeadersFromRouter(false);
+
+  EXPECT_TRUE(filter->on_host_selected_called_);
+  EXPECT_FALSE(upstream_request_->sentLocalReply());
 }
 
 TEST_F(UpstreamRequestTest, OnHostSelectedMultipleCallbacksStopsAfterSendLocalReply) {
@@ -397,12 +438,115 @@ TEST_F(UpstreamRequestTest, OnHostSelectedMultipleCallbacksStopsAfterSendLocalRe
   initialize();
 
   EXPECT_CALL(*conn_pool_, newStream(_)).Times(0);
-  EXPECT_CALL(router_filter_interface_.callbacks_,
-              sendLocalReply(Http::Code::Forbidden, _, _, _, _));
+  EXPECT_CALL(router_filter_interface_.callbacks_, sendLocalReply(_, _, _, _, _)).Times(0);
+  EXPECT_CALL(router_filter_interface_, onUpstreamHeaders(403, _, _, false));
+  EXPECT_CALL(router_filter_interface_,
+              onUpstreamData(BufferString("Connection rejected"), _, true));
   upstream_request_->acceptHeadersFromRouter(false);
 
   EXPECT_TRUE(filter1->on_host_selected_called_);
   EXPECT_FALSE(filter2->on_host_selected_called_);
+}
+
+TEST_F(UpstreamRequestTest, DecodeHeadersLocalReplyPassesThroughEncoderFilter) {
+  auto encoder_filter = std::make_shared<NiceMock<Http::MockStreamEncoderFilter>>();
+  auto decoder_filter = std::make_shared<NiceMock<Http::MockStreamDecoderFilter>>();
+
+  EXPECT_CALL(*router_filter_interface_.cluster_info_, createFilterChain(_))
+      .WillOnce(Invoke([&](Http::FilterChainFactoryCallbacks& callbacks) -> bool {
+        callbacks.setFilterConfigName("encoder_filter");
+        callbacks.addStreamEncoderFilter(encoder_filter);
+        callbacks.setFilterConfigName("decoder_filter");
+        callbacks.addStreamDecoderFilter(decoder_filter);
+        callbacks.setFilterConfigName("codec_filter");
+        callbacks.addStreamDecoderFilter(std::make_shared<UpstreamCodecFilter>());
+        return true;
+      }));
+
+  initialize();
+
+  EXPECT_CALL(*conn_pool_, newStream(_));
+  EXPECT_CALL(*conn_pool_, cancelAnyPendingStream()).WillOnce(Return(true));
+  EXPECT_CALL(*decoder_filter, decodeHeaders(_, true))
+      .WillOnce(Invoke([&](Http::RequestHeaderMap&, bool) {
+        decoder_filter->callbacks_->sendLocalReply(Http::Code::BadRequest, "bad request", nullptr,
+                                                   std::nullopt, "decoder_local_reply");
+        return Http::FilterHeadersStatus::StopIteration;
+      }));
+  EXPECT_CALL(*encoder_filter, encodeHeaders(_, false))
+      .WillOnce(Invoke([](Http::ResponseHeaderMap& headers, bool) {
+        headers.addCopy(Http::LowerCaseString("x-upstream-encoder"), "true");
+        return Http::FilterHeadersStatus::Continue;
+      }));
+  EXPECT_CALL(*encoder_filter, encodeData(BufferString("bad request"), true))
+      .WillOnce(Return(Http::FilterDataStatus::Continue));
+
+  EXPECT_CALL(router_filter_interface_.callbacks_, sendLocalReply(_, _, _, _, _)).Times(0);
+  EXPECT_CALL(router_filter_interface_, onUpstreamHeaders(400, _, _, false))
+      .WillOnce(Invoke([](uint64_t, Http::ResponseHeaderMapPtr&& headers, UpstreamRequest&, bool) {
+        EXPECT_EQ(
+            headers->get(Http::LowerCaseString("x-upstream-encoder"))[0]->value().getStringView(),
+            "true");
+      }));
+  EXPECT_CALL(router_filter_interface_, onUpstreamData(BufferString("bad request"), _, true));
+
+  upstream_request_->acceptHeadersFromRouter(true);
+
+  EXPECT_TRUE(upstream_request_->sentLocalReply());
+  EXPECT_EQ(upstream_request_->streamInfo().responseCodeDetails(), "decoder_local_reply");
+}
+
+TEST_F(UpstreamRequestTest, DecodeDataLocalReplyResetsUpstreamStreamAndPassesThroughEncoderFilter) {
+  auto encoder_filter = std::make_shared<NiceMock<Http::MockStreamEncoderFilter>>();
+  auto decoder_filter = std::make_shared<NiceMock<Http::MockStreamDecoderFilter>>();
+
+  EXPECT_CALL(*router_filter_interface_.cluster_info_, createFilterChain(_))
+      .WillOnce(Invoke([&](Http::FilterChainFactoryCallbacks& callbacks) -> bool {
+        callbacks.setFilterConfigName("encoder_filter");
+        callbacks.addStreamEncoderFilter(encoder_filter);
+        callbacks.setFilterConfigName("decoder_filter");
+        callbacks.addStreamDecoderFilter(decoder_filter);
+        callbacks.setFilterConfigName("codec_filter");
+        callbacks.addStreamDecoderFilter(std::make_shared<UpstreamCodecFilter>());
+        return true;
+      }));
+
+  initialize();
+
+  GenericConnectionPoolCallbacks* pool_callbacks = nullptr;
+  EXPECT_CALL(*conn_pool_, newStream(_))
+      .WillOnce(
+          Invoke([&](GenericConnectionPoolCallbacks* callbacks) { pool_callbacks = callbacks; }));
+  EXPECT_CALL(*decoder_filter, decodeHeaders(_, false))
+      .WillOnce(Return(Http::FilterHeadersStatus::Continue));
+
+  upstream_request_->acceptHeadersFromRouter(false);
+  ASSERT_NE(pool_callbacks, nullptr);
+
+  auto mock_upstream_unique = std::make_unique<NiceMock<MockGenericUpstream>>();
+  auto* mock_upstream = mock_upstream_unique.get();
+  EXPECT_CALL(*mock_upstream, encodeHeaders(_, false)).WillOnce(Return(Http::okStatus()));
+  pool_callbacks->onPoolReady(std::move(mock_upstream_unique), host_, connection_info_provider_,
+                              stream_info_, std::nullopt);
+
+  EXPECT_CALL(*decoder_filter, decodeData(_, true)).WillOnce(Invoke([&](Buffer::Instance&, bool) {
+    decoder_filter->callbacks_->sendLocalReply(Http::Code::PayloadTooLarge, "too large", nullptr,
+                                               std::nullopt, "data_local_reply");
+    return Http::FilterDataStatus::StopIterationNoBuffer;
+  }));
+  EXPECT_CALL(*mock_upstream, resetStream());
+  EXPECT_CALL(*encoder_filter, encodeHeaders(_, false))
+      .WillOnce(Return(Http::FilterHeadersStatus::Continue));
+  EXPECT_CALL(*encoder_filter, encodeData(BufferString("too large"), true))
+      .WillOnce(Return(Http::FilterDataStatus::Continue));
+  EXPECT_CALL(router_filter_interface_, onUpstreamHeaders(413, _, _, false));
+  EXPECT_CALL(router_filter_interface_, onUpstreamData(BufferString("too large"), _, true));
+
+  Buffer::OwnedImpl body("request body");
+  upstream_request_->acceptDataFromRouter(body, true);
+
+  EXPECT_TRUE(upstream_request_->sentLocalReply());
+  EXPECT_EQ(upstream_request_->streamInfo().responseCodeDetails(), "data_local_reply");
 }
 
 TEST_F(UpstreamRequestTest, ReentrantResetDuringDecodeData) {
@@ -466,6 +610,140 @@ TEST_F(UpstreamRequestTest, ReentrantResetDuringDecodeMetadata) {
   Http::FilterMetadataStatus status = codec_filter->decodeMetadata(metadata);
   EXPECT_EQ(status, Http::FilterMetadataStatus::StopIterationForLocalReply);
   upstream_request_.reset();
+}
+
+// Upstream filter local replies reset the upstream before the reply is encoded back through the
+// upstream filter chain. Response buffer watermark callbacks raised while encoding that reply must
+// not touch the cleared upstream.
+TEST_F(UpstreamRequestTest, CodecFilterWatermarksAfterUpstreamResetAreNoops) {
+  MockGenericUpstream* mock_upstream_ptr = nullptr;
+  UpstreamToDownstream* bridge = nullptr;
+  std::shared_ptr<UpstreamCodecFilter> codec_filter;
+  setupUpstreamAndGetBridge(mock_upstream_ptr, bridge, &codec_filter);
+
+  EXPECT_CALL(*mock_upstream_ptr, readDisable(_)).Times(0);
+  EXPECT_CALL(*mock_upstream_ptr, resetStream());
+  upstream_request_->resetStream();
+
+  codec_filter->onAboveWriteBufferHighWatermark();
+  codec_filter->onBelowWriteBufferLowWatermark();
+  upstream_request_.reset();
+}
+
+// A downstream write buffer above the high watermark before the response starts defers reading
+// from the upstream until the response headers arrive. An upstream filter local reply produces
+// those headers after resetting the upstream, so the deferred readDisable() must be dropped.
+TEST_F(UpstreamRequestTest, DeferredReadDisableDroppedForLocalReplyAfterUpstreamReset) {
+  auto decoder_filter = std::make_shared<NiceMock<Http::MockStreamDecoderFilter>>();
+  EXPECT_CALL(*router_filter_interface_.cluster_info_, createFilterChain(_))
+      .WillOnce(Invoke([&](Http::FilterChainFactoryCallbacks& callbacks) -> bool {
+        callbacks.setFilterConfigName("decoder_filter");
+        callbacks.addStreamDecoderFilter(decoder_filter);
+        callbacks.setFilterConfigName("codec_filter");
+        callbacks.addStreamDecoderFilter(std::make_shared<UpstreamCodecFilter>());
+        return true;
+      }));
+  initialize();
+
+  GenericConnectionPoolCallbacks* pool_callbacks = nullptr;
+  EXPECT_CALL(*conn_pool_, newStream(_))
+      .WillOnce(
+          Invoke([&](GenericConnectionPoolCallbacks* callbacks) { pool_callbacks = callbacks; }));
+  EXPECT_CALL(*decoder_filter, decodeHeaders(_, false))
+      .WillOnce(Return(Http::FilterHeadersStatus::Continue));
+  upstream_request_->acceptHeadersFromRouter(false);
+  ASSERT_NE(pool_callbacks, nullptr);
+
+  auto mock_upstream_unique = std::make_unique<NiceMock<MockGenericUpstream>>();
+  auto* mock_upstream = mock_upstream_unique.get();
+  EXPECT_CALL(*mock_upstream, encodeHeaders(_, false)).WillOnce(Return(Http::okStatus()));
+  pool_callbacks->onPoolReady(std::move(mock_upstream_unique), host_, connection_info_provider_,
+                              stream_info_, std::nullopt);
+
+  // The downstream goes above the high watermark before the response has started, so the
+  // upstream readDisable() is deferred.
+  ASSERT_EQ(1U, router_filter_interface_.callbacks_.callbacks_.size());
+  ON_CALL(router_filter_interface_, downstreamResponseStarted()).WillByDefault(Return(false));
+  EXPECT_CALL(*mock_upstream, readDisable(_)).Times(0);
+  router_filter_interface_.callbacks_.callbacks_.front()->onAboveWriteBufferHighWatermark();
+
+  EXPECT_CALL(*decoder_filter, decodeData(_, true)).WillOnce(Invoke([&](Buffer::Instance&, bool) {
+    decoder_filter->callbacks_->sendLocalReply(Http::Code::PayloadTooLarge, "too large", nullptr,
+                                               std::nullopt, "data_local_reply");
+    return Http::FilterDataStatus::StopIterationNoBuffer;
+  }));
+  EXPECT_CALL(*mock_upstream, resetStream());
+  EXPECT_CALL(router_filter_interface_, onUpstreamHeaders(413, _, _, false));
+  EXPECT_CALL(router_filter_interface_, onUpstreamData(BufferString("too large"), _, true));
+
+  Buffer::OwnedImpl body("request body");
+  upstream_request_->acceptDataFromRouter(body, true);
+  EXPECT_TRUE(upstream_request_->sentLocalReply());
+}
+
+// When both last_upstream_tx_byte_sent_ and last_upstream_rx_byte_received_ are already set,
+// UpstreamRequest::resetStream() skips resetting the completed codec stream, but must still call
+// clearRequestEncoder() so subsequent callbacks do not access a released upstream.
+TEST_F(UpstreamRequestTest, ResetStreamClearsRequestEncoderAfterUpstreamTxAndRxComplete) {
+  MockGenericUpstream* mock_upstream_ptr = nullptr;
+  UpstreamToDownstream* bridge = nullptr;
+  std::shared_ptr<UpstreamCodecFilter> codec_filter;
+  setupUpstreamAndGetBridge(mock_upstream_ptr, bridge, &codec_filter);
+
+  auto& time_system = router_filter_interface_.callbacks_.dispatcher_.globalTimeSystem();
+  upstream_request_->streamInfo().upstreamInfo()->upstreamTiming().onLastUpstreamTxByteSent(
+      time_system);
+  upstream_request_->streamInfo().upstreamInfo()->upstreamTiming().onFirstUpstreamRxByteReceived(
+      time_system);
+  upstream_request_->streamInfo().upstreamInfo()->upstreamTiming().onLastUpstreamRxByteReceived(
+      time_system);
+
+  EXPECT_CALL(*mock_upstream_ptr, resetStream()).Times(0);
+  upstream_request_->resetStream();
+
+  // After clearRequestEncoder(), watermark callbacks on the codec filter must be no-ops.
+  EXPECT_CALL(*mock_upstream_ptr, readDisable(_)).Times(0);
+  codec_filter->onAboveWriteBufferHighWatermark();
+  codec_filter->onBelowWriteBufferLowWatermark();
+  upstream_request_.reset();
+}
+
+// If an upstream filter callback in notifyHostSelected() resets the stream directly (which
+// destroys the upstream filters without setting decoder_filter_chain_aborted_),
+// notifyHostSelected() must detect state().destroyed_ via isAborted() and stop before newStream()
+// or decodeHeaders().
+TEST_F(UpstreamRequestTest, OnHostSelectedDirectResetStreamAbortsNotifyHostSelected) {
+  class ResetInOnHostSelectedFilter : public TestUpstreamFilter {
+  public:
+    void onHostSelected(const Upstream::HostDescriptionConstSharedPtr& host) override {
+      on_host_selected_called_ = true;
+      last_host_ = host;
+      callbacks_->resetStream();
+    }
+  };
+  auto filter1 = std::make_shared<ResetInOnHostSelectedFilter>();
+  auto filter2 = std::make_shared<TestUpstreamFilter>();
+
+  EXPECT_CALL(*router_filter_interface_.cluster_info_, createFilterChain(_))
+      .WillOnce(Invoke([&](Http::FilterChainFactoryCallbacks& callbacks) -> bool {
+        callbacks.setFilterConfigName("filter1");
+        callbacks.addStreamDecoderFilter(filter1);
+        callbacks.setFilterConfigName("filter2");
+        callbacks.addStreamDecoderFilter(filter2);
+        callbacks.setFilterConfigName("codec_filter");
+        callbacks.addStreamDecoderFilter(std::make_shared<UpstreamCodecFilter>());
+        return true;
+      }));
+  initialize();
+
+  EXPECT_CALL(router_filter_interface_.callbacks_, resetStream(_, _))
+      .WillOnce(Invoke(
+          [&](Http::StreamResetReason, absl::string_view) { upstream_request_->cleanUp(); }));
+  EXPECT_CALL(*conn_pool_, newStream(_)).Times(0);
+
+  upstream_request_->acceptHeadersFromRouter(true);
+  EXPECT_TRUE(filter1->on_host_selected_called_);
+  EXPECT_FALSE(filter2->on_host_selected_called_);
 }
 
 } // namespace

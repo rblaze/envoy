@@ -1,0 +1,3 @@
+* area: router
+  change: |
+    Upstream HTTP filter local replies (``sendLocalReply``) are now routed through the upstream HTTP encoder filter chain and into the router filter instead of bypassing the upstream filter chain and sending the reply directly to the downstream HTTP connection manager. This allows earlier upstream encoder filters to observe and modify local replies and allows the router to retry upstream filter local replies according to the configured retry policy. This behavioral change can be temporarily reverted by setting runtime guard ``envoy.reloadable_features.upstream_filter_local_reply_via_upstream_filter_chain`` to ``false``.

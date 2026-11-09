@@ -38,12 +38,21 @@ UpstreamCodecFilter::ScopedEncodingTracker::~ScopedEncodingTracker() {
   filter_->calling_encode_ = false;
 }
 
+// Upstream HTTP filter local replies reset the upstream stream before the local reply is encoded
+// back through the upstream filter chain, so the watermark callbacks below may fire after the
+// upstream has been cleared.
 void UpstreamCodecFilter::onBelowWriteBufferLowWatermark() {
+  if (!callbacks_->upstreamCallbacks()->upstream()) {
+    return;
+  }
   callbacks_->clusterInfo()->trafficStats()->upstream_flow_control_resumed_reading_total_.inc();
   callbacks_->upstreamCallbacks()->upstream()->readDisable(false);
 }
 
 void UpstreamCodecFilter::onAboveWriteBufferHighWatermark() {
+  if (!callbacks_->upstreamCallbacks()->upstream()) {
+    return;
+  }
   callbacks_->clusterInfo()->trafficStats()->upstream_flow_control_paused_reading_total_.inc();
   callbacks_->upstreamCallbacks()->upstream()->readDisable(true);
 }
@@ -78,7 +87,14 @@ Http::FilterHeadersStatus UpstreamCodecFilter::decodeHeaders(Http::RequestHeader
   if (!status.ok() || deferred_reset_.has_value()) {
     // It is possible that encodeHeaders() fails. This can happen if filters or other extensions
     // erroneously remove required headers.
-    callbacks_->streamInfo().setResponseFlag(StreamInfo::CoreResponseFlag::DownstreamProtocolError);
+    if (Runtime::runtimeFeatureEnabled(
+            "envoy.reloadable_features.upstream_filter_local_reply_via_upstream_filter_chain")) {
+      callbacks_->upstreamCallbacks()->upstreamStreamInfo().setResponseFlag(
+          StreamInfo::CoreResponseFlag::DownstreamProtocolError);
+    } else {
+      callbacks_->streamInfo().setResponseFlag(
+          StreamInfo::CoreResponseFlag::DownstreamProtocolError);
+    }
     const std::string details =
         !deferred_reset_.has_value()
             ? absl::StrCat(
