@@ -1,14 +1,24 @@
 #include <atomic>
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <optional>
 #include <ostream>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "envoy/config/bootstrap/v3/bootstrap.pb.h"
+#include "envoy/config/route/v3/route_components.pb.h"
 #include "envoy/extensions/access_loggers/file/v3/file.pb.h"
 #include "envoy/extensions/filters/http/router/v3/router.pb.h"
+#include "envoy/extensions/filters/http/upstream_codec/v3/upstream_codec.pb.h"
 #include "envoy/extensions/filters/network/http_connection_manager/v3/http_connection_manager.pb.h"
 #include "envoy/grpc/status.h"
+#include "envoy/stream_info/filter_state.h"
+#include "envoy/upstream/retry.h"
 
+#include "source/common/common/macros.h"
 #include "source/extensions/filters/http/common/pass_through_filter.h"
 
 #include "test/config/utility.h"
@@ -16,10 +26,17 @@
 #include "test/integration/filters/repick_cluster_filter.h"
 #include "test/integration/filters/test_filters.pb.h"
 #include "test/integration/http_integration.h"
+#include "test/integration/test_host_predicate.pb.h"
 #include "test/mocks/http/mocks.h"
 
+#include "absl/base/thread_annotations.h"
+#include "absl/container/flat_hash_set.h"
+#include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
+#include "gmock/gmock.h"
+#include "gtest/gtest.h"
 
 namespace Envoy {
 namespace {
@@ -46,37 +63,80 @@ using testing::Not;
 class FilterCallTracker {
 public:
   static void reset() {
-    absl::MutexLock lock(mutex_);
-    trace_.clear();
+    absl::MutexLock lock(mutex());
+    traceVector().clear();
+    selectedHostsVector().clear();
+    lastDecodedBodyString().clear();
   }
 
   static void record(absl::string_view event) {
-    absl::MutexLock lock(mutex_);
-    trace_.emplace_back(event);
+    absl::MutexLock lock(mutex());
+    traceVector().emplace_back(event);
   }
 
   static std::vector<std::string> trace() {
-    absl::MutexLock lock(mutex_);
-    return trace_;
+    absl::MutexLock lock(mutex());
+    return traceVector();
+  }
+
+  static void recordSelectedHost(absl::string_view host) {
+    absl::MutexLock lock(mutex());
+    selectedHostsVector().emplace_back(host);
+  }
+
+  static std::vector<std::string> selectedHosts() {
+    absl::MutexLock lock(mutex());
+    return selectedHostsVector();
+  }
+
+  static void clearDecodedBody() {
+    absl::MutexLock lock(mutex());
+    lastDecodedBodyString().clear();
+  }
+
+  static void appendDecodedBody(absl::string_view data) {
+    absl::MutexLock lock(mutex());
+    absl::StrAppend(&lastDecodedBodyString(), data);
+  }
+
+  static std::string lastDecodedBody() {
+    absl::MutexLock lock(mutex());
+    return lastDecodedBodyString();
   }
 
 private:
-  static inline absl::Mutex mutex_;
-  static inline std::vector<std::string> trace_ ABSL_GUARDED_BY(mutex_);
+  static absl::Mutex& mutex() { MUTABLE_CONSTRUCT_ON_FIRST_USE(absl::Mutex); }
+  static std::vector<std::string>& traceVector() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex()) {
+    MUTABLE_CONSTRUCT_ON_FIRST_USE(std::vector<std::string>);
+  }
+  static std::vector<std::string>& selectedHostsVector() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex()) {
+    MUTABLE_CONSTRUCT_ON_FIRST_USE(std::vector<std::string>);
+  }
+  static std::string& lastDecodedBodyString() ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex()) {
+    MUTABLE_CONSTRUCT_ON_FIRST_USE(std::string);
+  }
 };
 
 class DownstreamResponseModifyingEncoderFilter : public Http::PassThroughEncoderFilter {
 public:
-  static constexpr absl::string_view kBodySuffix = " [downstream-encoded]";
+  static constexpr absl::string_view BodySuffix = " [downstream-encoded]";
+
+  Http::LocalErrorStatus onLocalReply(const LocalReplyData&) override {
+    saw_on_local_reply_ = true;
+    return Http::LocalErrorStatus::Continue;
+  }
 
   Http::FilterHeadersStatus encodeHeaders(Http::ResponseHeaderMap& headers,
                                           bool end_stream) override {
     FilterCallTracker::record("downstream:encodeHeaders");
     headers.addCopy(Http::LowerCaseString("x-downstream-encoder-modified"), "yes");
+    if (saw_on_local_reply_) {
+      headers.addCopy(Http::LowerCaseString("x-downstream-saw-on-local-reply"), "yes");
+    }
     if (!end_stream && headers.ContentLength() != nullptr) {
       uint64_t len = 0;
       if (absl::SimpleAtoi(headers.getContentLengthValue(), &len)) {
-        headers.setContentLength(len + kBodySuffix.size());
+        headers.setContentLength(len + BodySuffix.size());
       }
     }
     return Http::FilterHeadersStatus::Continue;
@@ -84,10 +144,13 @@ public:
   Http::FilterDataStatus encodeData(Buffer::Instance& data, bool end_stream) override {
     FilterCallTracker::record("downstream:encodeData");
     if (end_stream) {
-      data.add(kBodySuffix);
+      data.add(BodySuffix);
     }
     return Http::FilterDataStatus::Continue;
   }
+
+private:
+  bool saw_on_local_reply_{false};
 };
 
 class DownstreamResponseModifyingEncoderFilterFactory
@@ -117,7 +180,7 @@ class UpstreamResponseModifyingEncoderFilter
     : public Http::PassThroughEncoderFilter,
       public std::enable_shared_from_this<UpstreamResponseModifyingEncoderFilter> {
 public:
-  static constexpr absl::string_view kBodySuffix = " [upstream-encoded]";
+  static constexpr absl::string_view BodySuffix = " [upstream-encoded]";
 
   // Per-test knobs. `max_action_attempts_` limits the status rewrite and chained local reply
   // actions to the first N attempts (-1 means every attempt). `async_pause_attempts_` pauses the
@@ -181,7 +244,7 @@ public:
     if (!end_stream && headers.ContentLength() != nullptr) {
       uint64_t len = 0;
       if (absl::SimpleAtoi(headers.getContentLengthValue(), &len)) {
-        headers.setContentLength(len + kBodySuffix.size());
+        headers.setContentLength(len + BodySuffix.size());
       }
     }
     return Http::FilterHeadersStatus::Continue;
@@ -199,7 +262,7 @@ public:
           self->latched_headers_->addCopy(Http::LowerCaseString("x-upstream-encoder-modified"),
                                           "yes");
           self->encoder_callbacks_->modifyEncodingBuffer(
-              [](Buffer::Instance& buffer) { buffer.add(kBodySuffix); });
+              [](Buffer::Instance& buffer) { buffer.add(BodySuffix); });
           if (self->latched_headers_->ContentLength() != nullptr) {
             self->latched_headers_->setContentLength(
                 self->encoder_callbacks_->encodingBuffer()->length());
@@ -211,7 +274,7 @@ public:
     }
 
     if (end_stream) {
-      data.add(kBodySuffix);
+      data.add(BodySuffix);
     }
     return Http::FilterDataStatus::Continue;
   }
@@ -261,8 +324,14 @@ public:
     FilterCallTracker::reset();
   }
 
+  class AttemptNumberObject : public StreamInfo::FilterState::Object {
+  public:
+    explicit AttemptNumberObject(int attempt) : attempt_(attempt) {}
+    const int attempt_;
+  };
+
   explicit UpstreamConfigurableLocalReplyFilter(std::string filter_name = "")
-      : filter_name_(std::move(filter_name)), attempt_(++total_attempts_) {}
+      : filter_name_(std::move(filter_name)) {}
 
   bool shouldFail() const {
     if (!target_filter_.empty() && target_filter_ != filter_name_) {
@@ -276,6 +345,9 @@ public:
 
   // Http::StreamDecoderFilter
   Http::FilterHeadersStatus decodeHeaders(Http::RequestHeaderMap& headers, bool) override {
+    if (first_in_chain_) {
+      FilterCallTracker::clearDecodedBody();
+    }
     if (!filter_name_.empty()) {
       FilterCallTracker::record(absl::StrCat(filter_name_, ":decodeHeaders"));
       headers.appendCopy(Http::LowerCaseString("x-upstream-decode-order"), filter_name_);
@@ -327,7 +399,10 @@ public:
     }
     return Http::FilterHeadersStatus::Continue;
   }
-  Http::FilterDataStatus decodeData(Buffer::Instance&, bool) override {
+  Http::FilterDataStatus decodeData(Buffer::Instance& data, bool) override {
+    if (first_in_chain_) {
+      FilterCallTracker::appendDecodedBody(data.toString());
+    }
     if (!filter_name_.empty()) {
       FilterCallTracker::record(absl::StrCat(filter_name_, ":decodeData"));
     }
@@ -365,6 +440,22 @@ public:
     decoder_callbacks_ = &callbacks;
     if (auto cb = decoder_callbacks_->upstreamCallbacks(); cb) {
       cb->addUpstreamCallbacks(*this);
+      auto& filter_state = cb->upstreamStreamInfo().filterState();
+      const auto* existing =
+          filter_state->getDataReadOnly<AttemptNumberObject>("test.upstream_attempt_number");
+      if (existing != nullptr) {
+        attempt_ = existing->attempt_;
+        first_in_chain_ = false;
+      } else {
+        attempt_ = ++total_attempts_;
+        first_in_chain_ = true;
+        filter_state->setData("test.upstream_attempt_number",
+                              std::make_shared<AttemptNumberObject>(attempt_),
+                              StreamInfo::FilterState::LifeSpan::FilterChain);
+      }
+    } else {
+      attempt_ = ++total_attempts_;
+      first_in_chain_ = true;
     }
   }
 
@@ -394,7 +485,10 @@ public:
   }
 
   // Http::UpstreamCallbacks
-  void onHostSelected(const Upstream::HostDescriptionConstSharedPtr&) override {
+  void onHostSelected(const Upstream::HostDescriptionConstSharedPtr& host) override {
+    if (first_in_chain_ && host != nullptr && host->address() != nullptr) {
+      FilterCallTracker::recordSelectedHost(host->address()->asString());
+    }
     if (on_host_selected_code_.load() > 0 && shouldFail()) {
       decoder_callbacks_->sendLocalReply(static_cast<Http::Code>(on_host_selected_code_.load()),
                                          "upstream local reply", nullptr, std::nullopt,
@@ -418,7 +512,8 @@ public:
   }
 
   const std::string filter_name_;
-  const int attempt_;
+  int attempt_{0};
+  bool first_in_chain_{true};
   bool destroyed_{false};
   bool async_posted_{false};
   std::string target_filter_;
@@ -455,6 +550,41 @@ Registry::RegisterFactory<UpstreamConfigurableLocalReplyFilterFactory,
                           Server::Configuration::UpstreamHttpFilterConfigFactory>
     register_upstream_configurable_local_reply_filter_;
 
+// RetryHostPredicate that rejects any host previously recorded via onHostAttempted().
+class ExcludeAttemptedHostsTestPredicate : public Upstream::RetryHostPredicate {
+public:
+  bool shouldSelectAnotherHost(const Upstream::Host& candidate_host) override {
+    return attempted_host_addresses_.contains(candidate_host.address()->asString());
+  }
+
+  void onHostAttempted(Upstream::HostDescriptionConstSharedPtr attempted_host) override {
+    if (attempted_host != nullptr && attempted_host->address() != nullptr) {
+      attempted_host_addresses_.insert(attempted_host->address()->asString());
+    }
+  }
+
+private:
+  absl::flat_hash_set<std::string> attempted_host_addresses_;
+};
+
+class ExcludeAttemptedHostsTestPredicateFactory : public Upstream::RetryHostPredicateFactory {
+public:
+  std::string name() const override { return "envoy.test.exclude_attempted_hosts_predicate"; }
+
+  Upstream::RetryHostPredicateSharedPtr createHostPredicate(const Protobuf::Message&,
+                                                            uint32_t) override {
+    return std::make_shared<ExcludeAttemptedHostsTestPredicate>();
+  }
+
+  ProtobufTypes::MessagePtr createEmptyConfigProto() override {
+    return std::make_unique<::test::integration::TestHostPredicate>();
+  }
+};
+
+Registry::RegisterFactory<ExcludeAttemptedHostsTestPredicateFactory,
+                          Upstream::RetryHostPredicateFactory>
+    register_exclude_attempted_hosts_test_predicate_;
+
 class UpstreamHttpFilterIntegrationTestBase : public HttpIntegrationTest {
 public:
   UpstreamHttpFilterIntegrationTestBase(Network::Address::IpVersion version,
@@ -464,6 +594,11 @@ public:
     setUpstreamProtocol(Http::CodecType::HTTP2);
     skip_tag_extraction_rule_check_ = true;
     autonomous_upstream_ = true;
+    UpstreamConfigurableLocalReplyFilter::resetState();
+  }
+
+  ~UpstreamHttpFilterIntegrationTestBase() override {
+    UpstreamConfigurableLocalReplyFilter::resetState();
   }
 
   void addStaticClusterFilter(const HttpFilterProto& config) {
@@ -1015,6 +1150,13 @@ TEST_P(StaticRouterOrClusterFiltersIntegrationTest,
     ASSERT_TRUE(response->complete());
     EXPECT_EQ("503", response->headers().getStatusValue());
   }
+  // Send a normal request that reaches the backend so outlier detection processes a real upstream
+  // completion before asserting that no consecutive-5xx ejection occurred.
+  auto normal_response = codec_client_->makeHeaderOnlyRequest(default_request_headers_);
+  ASSERT_TRUE(normal_response->waitForEndStream());
+  ASSERT_TRUE(normal_response->complete());
+  EXPECT_EQ("200", normal_response->headers().getStatusValue());
+  test_server_->waitForCounter("cluster.cluster_0.upstream_rq_200", testing::Eq(1));
   const std::string outlier_prefix = "cluster.cluster_0.outlier_detection.";
   EXPECT_EQ(0UL, counterValueOrZero(outlier_prefix + "ejections_detected_consecutive_5xx"));
   EXPECT_EQ(0UL, counterValueOrZero(outlier_prefix + "ejections_enforced_total"));
@@ -1081,28 +1223,6 @@ TEST_P(StaticRouterOrClusterFiltersIntegrationTest,
   EXPECT_EQ(1, UpstreamConfigurableLocalReplyFilter::total_attempts_.load());
   EXPECT_EQ(1, UpstreamResponseModifyingEncoderFilter::total_attempts_.load());
   EXPECT_EQ(0UL, test_server_->counter("cluster.cluster_0.upstream_rq_retry")->value());
-
-  cleanupUpstreamAndDownstream();
-}
-
-// Verify that an upstream encoder filter calling sendLocalReply during encodeHeaders sends a
-// direct local reply to Router::Filter and is retriable.
-TEST_P(StaticRouterOrClusterFiltersIntegrationTest,
-       UpstreamEncoderFilterLocalReplyInEncodeHeadersRetried) {
-  addRouteRetryPolicy(config_helper_, "5xx", 2);
-  UpstreamConfigurableLocalReplyFilter::resetState(/*fail_attempts=*/1);
-  addUpstreamConfigurableLocalReplyFilter();
-  addCodecFilter();
-  initialize();
-
-  codec_client_ = makeHttpConnection(lookupPort("http"));
-  auto response =
-      codec_client_->makeHeaderOnlyRequest(localReplyHeaders("GET", "encode-headers", "502"));
-  ASSERT_TRUE(response->waitForEndStream());
-  ASSERT_TRUE(response->complete());
-  EXPECT_EQ("200", response->headers().getStatusValue());
-  EXPECT_EQ(2, UpstreamConfigurableLocalReplyFilter::total_attempts_.load());
-  test_server_->waitForCounter("cluster.cluster_0.upstream_rq_retry", testing::Eq(1));
 
   cleanupUpstreamAndDownstream();
 }
@@ -1229,13 +1349,19 @@ TEST_P(StaticRouterOrClusterFiltersIntegrationTest,
   // Case 2: async local reply after decodeData returned StopIterationAndBuffer. The router replays
   // the buffered request body on the retry.
   UpstreamConfigurableLocalReplyFilter::resetState(/*fail_attempts=*/1);
-  auto response2 = codec_client_->makeRequestWithBody(
-      localReplyHeaders("POST", "async-decode-data", "503"), "request body");
+  Http::TestRequestHeaderMapImpl async_data_headers =
+      localReplyHeaders("POST", "async-decode-data", "503");
+  async_data_headers.addCopy(AutonomousStream::EXPECT_REQUEST_SIZE_BYTES,
+                             std::to_string(absl::string_view("request body").size()));
+  auto response2 = codec_client_->makeRequestWithBody(async_data_headers, "request body");
   ASSERT_TRUE(response2->waitForEndStream());
   ASSERT_TRUE(response2->complete());
   EXPECT_EQ("200", response2->headers().getStatusValue());
   EXPECT_THAT(response2->headers(), ContainsHeader("x-upstream-encoder-modified", "yes"));
   EXPECT_EQ(2, UpstreamConfigurableLocalReplyFilter::total_attempts_.load());
+  EXPECT_EQ("request body", FilterCallTracker::lastDecodedBody());
+  ASSERT_NE(nullptr,
+            reinterpret_cast<AutonomousUpstream*>(fake_upstreams_[0].get())->lastRequestHeaders());
   test_server_->waitForCounter("cluster.cluster_0.upstream_rq_retry", testing::Eq(2));
 
   cleanupUpstreamAndDownstream();
@@ -1502,8 +1628,9 @@ TEST_P(StaticRouterOrClusterFiltersIntegrationTest,
   ASSERT_TRUE(response->waitForReset());
   EXPECT_FALSE(response->complete());
   EXPECT_TRUE(response->body().empty());
-  // The local reply never reached the router, but its details are still recorded downstream.
-  EXPECT_THAT(waitForAccessLog(access_log_name_), HasSubstr("upstream_encode_data_local_reply"));
+  // The local reply never reached the router, but its details and response flags are still
+  // recorded downstream.
+  EXPECT_THAT(waitForAccessLog(access_log_name_), HasSubstr("upstream_encode_data_local_reply|-"));
 
   cleanupUpstreamAndDownstream();
 }
@@ -1646,6 +1773,338 @@ TEST_P(StaticRouterOrClusterFiltersIntegrationTest,
   EXPECT_THAT(log3, HasSubstr(absl::StrCat("via_upstream|", upstream_host, "|2|-")));
   EXPECT_THAT(log3, Not(HasSubstr("local_reply")));
 
+  cleanupUpstreamAndDownstream();
+}
+
+// Verify that static knobs on UpstreamResponseModifyingEncoderFilter do not leak from a preceding
+// test into a subsequent test that uses UpstreamResponseModifyingEncoderFilter without manually
+// resetting UpstreamConfigurableLocalReplyFilter's static state.
+TEST_P(StaticRouterOrClusterFiltersIntegrationTest,
+       UpstreamResponseModifyingFilterIsolatedAcrossTests) {
+  addUpstreamResponseModifyingFilter();
+  addCodecFilter();
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  auto response = codec_client_->makeHeaderOnlyRequest(default_request_headers_);
+  ASSERT_TRUE(response->waitForEndStream());
+  ASSERT_TRUE(response->complete());
+  EXPECT_EQ("200", response->headers().getStatusValue());
+  EXPECT_THAT(response->headers(), ContainsHeader("x-upstream-encoder-modified", "yes"));
+
+  cleanupUpstreamAndDownstream();
+}
+
+// Verify that fail_attempts and total_attempts_ in UpstreamConfigurableLocalReplyFilter count per
+// upstream attempt rather than per filter instance when multiple filters are chained.
+TEST_P(StaticRouterOrClusterFiltersIntegrationTest,
+       MultiFilterChainTargetFilterLocalReplyRetriedAndSucceeds) {
+  addRouteRetryPolicy(config_helper_, "5xx", 2);
+  addUpstreamConfigurableLocalReplyFilter("chain-filter-a");
+  addUpstreamConfigurableLocalReplyFilter("chain-filter-b");
+  addCodecFilter();
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  UpstreamConfigurableLocalReplyFilter::resetState(/*fail_attempts=*/1);
+  Http::TestRequestHeaderMapImpl headers = localReplyHeaders("GET", "decode-headers", "503");
+  headers.addCopy("x-local-reply-target-filter", "chain-filter-b");
+  auto response = codec_client_->makeHeaderOnlyRequest(headers);
+  ASSERT_TRUE(response->waitForEndStream());
+  ASSERT_TRUE(response->complete());
+  EXPECT_EQ("200", response->headers().getStatusValue());
+  EXPECT_EQ(2, UpstreamConfigurableLocalReplyFilter::total_attempts_.load());
+  test_server_->waitForCounter("cluster.cluster_0.upstream_rq_retry", testing::Eq(1));
+
+  cleanupUpstreamAndDownstream();
+}
+
+// Verify that an upstream filter local reply flows through Router::Filter (which applies route
+// response_headers_to_add) and downstream encoder filters without invoking the downstream HCM
+// LocalReply::rewrite() mapper or downstream filter onLocalReply(), whereas a downstream local
+// reply invokes both.
+TEST_P(StaticRouterOrClusterFiltersIntegrationTest,
+       UpstreamFilterLocalReplyAppliesRouteResponseHeadersAndSkipsHcmLocalReplyRewrite) {
+  config_helper_.prependFilter(R"EOF(
+name: downstream-response-modifying-encoder-filter
+typed_config:
+  "@type": type.googleapis.com/test.integration.filters.DownstreamResponseModifyingFilterConfig
+)EOF");
+  config_helper_.addConfigModifier(
+      [](envoy::extensions::filters::network::http_connection_manager::v3::HttpConnectionManager&
+             hcm) {
+        hcm.mutable_local_reply_config()
+            ->mutable_body_format()
+            ->mutable_text_format_source()
+            ->set_inline_string("hcm-rewritten-local-reply");
+        auto* route = hcm.mutable_route_config()->mutable_virtual_hosts(0)->mutable_routes(0);
+        route->mutable_match()->set_prefix("/routed");
+        auto* header_to_add = route->add_response_headers_to_add();
+        header_to_add->mutable_header()->set_key("x-route-response-header");
+        header_to_add->mutable_header()->set_value("from-route");
+      });
+  addUpstreamResponseModifyingFilter();
+  addUpstreamConfigurableLocalReplyFilter();
+  addCodecFilter();
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+
+  // 1. Upstream filter local reply on a matched route: route response_headers_to_add is applied by
+  // Router::Filter, and neither HCM local_reply_config nor downstream onLocalReply() runs.
+  UpstreamConfigurableLocalReplyFilter::resetState(/*fail_attempts=*/-1);
+  Http::TestRequestHeaderMapImpl upstream_reply_headers =
+      localReplyHeaders("GET", "decode-headers", "503");
+  upstream_reply_headers.setPath("/routed");
+  auto response1 = codec_client_->makeHeaderOnlyRequest(upstream_reply_headers);
+  ASSERT_TRUE(response1->waitForEndStream());
+  ASSERT_TRUE(response1->complete());
+  EXPECT_EQ("503", response1->headers().getStatusValue());
+  EXPECT_THAT(response1->headers(), ContainsHeader("x-route-response-header", "from-route"));
+  EXPECT_THAT(response1->headers(), ContainsHeader("x-upstream-encoder-modified", "yes"));
+  EXPECT_THAT(response1->headers(), ContainsHeader("x-downstream-encoder-modified", "yes"));
+  EXPECT_THAT(response1->headers(), Not(ContainsHeader("x-downstream-saw-on-local-reply", "yes")));
+  EXPECT_EQ("upstream local reply [upstream-encoded] [downstream-encoded]", response1->body());
+
+  // 2. Downstream route-not-found local reply: invokes downstream onLocalReply() and HCM
+  // local_reply_config rewrite.
+  Http::TestRequestHeaderMapImpl unmatched_headers{
+      {":method", "GET"}, {":path", "/unmatched"}, {":scheme", "https"}, {":authority", "host"}};
+  auto response2 = codec_client_->makeHeaderOnlyRequest(unmatched_headers);
+  ASSERT_TRUE(response2->waitForEndStream());
+  ASSERT_TRUE(response2->complete());
+  EXPECT_EQ("404", response2->headers().getStatusValue());
+  EXPECT_THAT(response2->headers(), ContainsHeader("x-downstream-saw-on-local-reply", "yes"));
+  EXPECT_EQ("hcm-rewritten-local-reply [downstream-encoded]", response2->body());
+
+  cleanupUpstreamAndDownstream();
+}
+
+// Contrast with the test above: when the runtime flag is disabled, an upstream filter local reply
+// delegates to the downstream filter manager, so downstream onLocalReply() and HCM
+// local_reply_config rewrite both run.
+TEST_P(StaticRouterOrClusterFiltersIntegrationTest,
+       UpstreamFilterLocalReplyRunsDownstreamOnLocalReplyAndHcmRewriteWhenRuntimeFlagDisabled) {
+  config_helper_.addRuntimeOverride(
+      "envoy.reloadable_features.upstream_filter_local_reply_via_upstream_filter_chain", "false");
+  config_helper_.prependFilter(R"EOF(
+name: downstream-response-modifying-encoder-filter
+typed_config:
+  "@type": type.googleapis.com/test.integration.filters.DownstreamResponseModifyingFilterConfig
+)EOF");
+  config_helper_.addConfigModifier(
+      [](envoy::extensions::filters::network::http_connection_manager::v3::HttpConnectionManager&
+             hcm) {
+        hcm.mutable_local_reply_config()
+            ->mutable_body_format()
+            ->mutable_text_format_source()
+            ->set_inline_string("hcm-rewritten-local-reply");
+      });
+  UpstreamConfigurableLocalReplyFilter::resetState(/*fail_attempts=*/-1);
+  addUpstreamResponseModifyingFilter();
+  addUpstreamConfigurableLocalReplyFilter();
+  addCodecFilter();
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  auto response =
+      codec_client_->makeHeaderOnlyRequest(localReplyHeaders("GET", "decode-headers", "503"));
+  ASSERT_TRUE(response->waitForEndStream());
+  ASSERT_TRUE(response->complete());
+  EXPECT_EQ("503", response->headers().getStatusValue());
+  EXPECT_THAT(response->headers(), Not(ContainsHeader("x-upstream-encoder-modified", "yes")));
+  EXPECT_THAT(response->headers(), ContainsHeader("x-downstream-saw-on-local-reply", "yes"));
+  EXPECT_EQ("hcm-rewritten-local-reply [downstream-encoded]", response->body());
+
+  cleanupUpstreamAndDownstream();
+}
+
+// Verify that when an upstream filter sends a local reply in onHostSelected(), the selected host
+// is recorded on the UpstreamRequest so a retry host predicate excludes that host on retry and
+// routes the retry attempt to a different host in a 2-endpoint cluster.
+TEST_P(StaticRouterOrClusterFiltersIntegrationTest,
+       OnHostSelectedLocalReplyRetriedOnDifferentHostWithPreviousHostsPredicate) {
+  setUpstreamCount(2);
+  config_helper_.addConfigModifier([](envoy::config::bootstrap::v3::Bootstrap& bootstrap) {
+    auto* cluster = bootstrap.mutable_static_resources()->mutable_clusters(0);
+    auto* locality_lb = cluster->mutable_load_assignment()->mutable_endpoints(0);
+    ASSERT_EQ(1, locality_lb->lb_endpoints_size());
+    *locality_lb->add_lb_endpoints() = locality_lb->lb_endpoints(0);
+    // Weight endpoint 0 heavily (10 vs 1) so weighted round-robin would keep picking endpoint 0
+    // on retry unless the retry host predicate excludes the host attempted in onHostSelected().
+    locality_lb->mutable_lb_endpoints(0)->mutable_load_balancing_weight()->set_value(10);
+    locality_lb->mutable_lb_endpoints(1)->mutable_load_balancing_weight()->set_value(1);
+  });
+  config_helper_.addConfigModifier([](envoy::extensions::filters::network::http_connection_manager::
+                                          v3::HttpConnectionManager& hcm) {
+    auto* route =
+        hcm.mutable_route_config()->mutable_virtual_hosts(0)->mutable_routes(0)->mutable_route();
+    auto* retry_policy = route->mutable_retry_policy();
+    retry_policy->set_retry_on("5xx");
+    retry_policy->mutable_num_retries()->set_value(1);
+    retry_policy->set_host_selection_retry_max_attempts(10);
+    auto* predicate = retry_policy->add_retry_host_predicate();
+    predicate->set_name("envoy.test.exclude_attempted_hosts_predicate");
+    std::ignore =
+        predicate->mutable_typed_config()->PackFrom(::test::integration::TestHostPredicate());
+  });
+  UpstreamConfigurableLocalReplyFilter::resetState(/*fail_attempts=*/1,
+                                                   /*on_host_selected_code=*/503);
+  addUpstreamConfigurableLocalReplyFilter();
+  addCodecFilter();
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  auto response = codec_client_->makeHeaderOnlyRequest(default_request_headers_);
+  ASSERT_TRUE(response->waitForEndStream());
+  ASSERT_TRUE(response->complete());
+  EXPECT_EQ("200", response->headers().getStatusValue());
+  EXPECT_EQ(2, UpstreamConfigurableLocalReplyFilter::total_attempts_.load());
+  test_server_->waitForCounter("cluster.cluster_0.upstream_rq_retry", testing::Eq(1));
+
+  const std::vector<std::string> selected_hosts = FilterCallTracker::selectedHosts();
+  ASSERT_EQ(2U, selected_hosts.size());
+  EXPECT_NE(selected_hosts[0], selected_hosts[1]);
+
+  auto upstream0_headers =
+      reinterpret_cast<AutonomousUpstream*>(fake_upstreams_[0].get())->lastRequestHeaders();
+  auto upstream1_headers =
+      reinterpret_cast<AutonomousUpstream*>(fake_upstreams_[1].get())->lastRequestHeaders();
+  const std::string upstream0_addr = fake_upstreams_[0]->localAddress()->asString();
+  const std::string upstream1_addr = fake_upstreams_[1]->localAddress()->asString();
+  if (selected_hosts[0] == upstream0_addr) {
+    EXPECT_EQ(upstream1_addr, selected_hosts[1]);
+    EXPECT_EQ(nullptr, upstream0_headers);
+    EXPECT_NE(nullptr, upstream1_headers);
+  } else {
+    EXPECT_EQ(upstream1_addr, selected_hosts[0]);
+    EXPECT_EQ(upstream0_addr, selected_hosts[1]);
+    EXPECT_EQ(nullptr, upstream1_headers);
+    EXPECT_NE(nullptr, upstream0_headers);
+  }
+
+  cleanupUpstreamAndDownstream();
+}
+
+// Verify that in a multi-filter upstream chain (chain-filter-a -> chain-filter-b -> chain-filter-c
+// -> codec) plus a downstream encoder filter, when chain-filter-b sends a local reply from
+// encodeHeaders, sendDirectLocalReply skips the remaining upstream encoder filter (chain-filter-a)
+// while still running the downstream encoder filter.
+TEST_P(StaticRouterOrClusterFiltersIntegrationTest,
+       MultiFilterChainEncoderLocalReplySkipsRemainingUpstreamEncodersAndRunsDownstreamEncoder) {
+  UpstreamConfigurableLocalReplyFilter::resetState();
+  config_helper_.prependFilter(R"EOF(
+name: downstream-response-modifying-encoder-filter
+typed_config:
+  "@type": type.googleapis.com/test.integration.filters.DownstreamResponseModifyingFilterConfig
+)EOF");
+  addUpstreamConfigurableLocalReplyFilter("chain-filter-a");
+  addUpstreamConfigurableLocalReplyFilter("chain-filter-b");
+  addUpstreamConfigurableLocalReplyFilter("chain-filter-c");
+  addCodecFilter();
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  FilterCallTracker::reset();
+  Http::TestRequestHeaderMapImpl headers = localReplyHeaders("GET", "encode-headers", "503");
+  headers.addCopy("x-local-reply-target-filter", "chain-filter-b");
+  auto response = codec_client_->makeHeaderOnlyRequest(headers);
+  ASSERT_TRUE(response->waitForEndStream());
+  ASSERT_TRUE(response->complete());
+  EXPECT_EQ("503", response->headers().getStatusValue());
+  EXPECT_TRUE(response->headers().get(Http::LowerCaseString("x-upstream-encode-order")).empty());
+  EXPECT_THAT(response->headers(), ContainsHeader("x-downstream-encoder-modified", "yes"));
+  EXPECT_EQ("upstream local reply [downstream-encoded]", response->body());
+  EXPECT_THAT(FilterCallTracker::trace(),
+              ElementsAre("chain-filter-a:decodeHeaders", "chain-filter-a:decodeComplete",
+                          "chain-filter-b:decodeHeaders", "chain-filter-b:decodeComplete",
+                          "chain-filter-c:decodeHeaders", "chain-filter-c:decodeComplete",
+                          "chain-filter-c:encodeHeaders", "chain-filter-b:encodeHeaders",
+                          "downstream:encodeHeaders", "downstream:encodeData"));
+
+  cleanupUpstreamAndDownstream();
+}
+
+// Verify end-to-end HTTP/1.1 downstream + HTTP/1.1 upstream filter local reply and retry over a
+// persistent connection.
+TEST_P(StaticRouterOrClusterFiltersIntegrationTest,
+       Http11DownstreamAndUpstreamFilterLocalReplyAndRetry) {
+  setDownstreamProtocol(Http::CodecType::HTTP1);
+  setUpstreamProtocol(Http::CodecType::HTTP1);
+  addRouteRetryPolicy(config_helper_, "5xx", 1);
+  addUpstreamResponseModifyingFilter();
+  addUpstreamConfigurableLocalReplyFilter();
+  addCodecFilter();
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+
+  // Request 1: attempt 1 fails with a 503 local reply in decodeHeaders; retry succeeds over
+  // HTTP/1.1.
+  UpstreamConfigurableLocalReplyFilter::resetState(/*fail_attempts=*/1);
+  auto response1 =
+      codec_client_->makeHeaderOnlyRequest(localReplyHeaders("GET", "decode-headers", "503"));
+  ASSERT_TRUE(response1->waitForEndStream());
+  ASSERT_TRUE(response1->complete());
+  EXPECT_EQ("200", response1->headers().getStatusValue());
+  EXPECT_THAT(response1->headers(), ContainsHeader("x-upstream-encoder-modified", "yes"));
+  EXPECT_EQ(2, UpstreamConfigurableLocalReplyFilter::total_attempts_.load());
+  test_server_->waitForCounter("cluster.cluster_0.upstream_rq_retry", testing::Eq(1));
+
+  // Request 2 on the same HTTP/1.1 keep-alive connection: retries exhausted, local reply returned.
+  UpstreamConfigurableLocalReplyFilter::resetState(/*fail_attempts=*/-1);
+  auto response2 =
+      codec_client_->makeHeaderOnlyRequest(localReplyHeaders("GET", "decode-headers", "503"));
+  ASSERT_TRUE(response2->waitForEndStream());
+  ASSERT_TRUE(response2->complete());
+  EXPECT_EQ("503", response2->headers().getStatusValue());
+  EXPECT_THAT(response2->headers(), ContainsHeader("x-upstream-encoder-modified", "yes"));
+  EXPECT_EQ("upstream local reply [upstream-encoded]", response2->body());
+  EXPECT_EQ(2, UpstreamConfigurableLocalReplyFilter::total_attempts_.load());
+  test_server_->waitForCounter("cluster.cluster_0.upstream_rq_retry", testing::Eq(2));
+
+  cleanupUpstreamAndDownstream();
+}
+
+// Retrying a POST request with both buffered body and trailers must not crash in continueDoRetry()
+// when an upstream HTTP filter sends a local reply in decodeData() on the retry attempt.
+TEST_P(StaticRouterOrClusterFiltersIntegrationTest, DecodeDataLocalReplyRetryWithTrailers) {
+  autonomous_allow_incomplete_streams_ = true;
+  config_helper_.addConfigModifier(
+      [](envoy::extensions::filters::network::http_connection_manager::v3::HttpConnectionManager&
+             hcm) {
+        auto* retry_policy = hcm.mutable_route_config()
+                                 ->mutable_virtual_hosts(0)
+                                 ->mutable_routes(0)
+                                 ->mutable_route()
+                                 ->mutable_retry_policy();
+        retry_policy->set_retry_on("5xx");
+        retry_policy->mutable_num_retries()->set_value(1);
+        retry_policy->mutable_retry_back_off()->mutable_base_interval()->set_nanos(100 * 1000 *
+                                                                                   1000);
+      });
+
+  addStaticTypedConfigFilter("local-reply-during-decode",
+                             test::integration::filters::LocalReplyDuringDecodeConfig());
+  addCodecFilter();
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  Http::TestRequestHeaderMapImpl post_headers{{":method", "POST"},
+                                              {":path", "/"},
+                                              {":scheme", "https"},
+                                              {":authority", "host"},
+                                              {"local-reply-during-data", "true"}};
+  auto encoder_decoder = codec_client_->startRequest(post_headers);
+  request_encoder_ = &encoder_decoder.first;
+  auto response = std::move(encoder_decoder.second);
+  codec_client_->sendData(*request_encoder_, "request body", false);
+  Http::TestRequestTrailerMapImpl request_trailers{{"x-req-trailer", "val"}};
+  codec_client_->sendTrailers(*request_encoder_, request_trailers);
+
+  ASSERT_TRUE(response->waitForEndStream());
+  EXPECT_TRUE(response->complete());
+  EXPECT_EQ("500", response->headers().getStatusValue());
   cleanupUpstreamAndDownstream();
 }
 
@@ -2334,48 +2793,6 @@ TEST_P(DynamicRouterAndClusterFiltersIntegrationTest, DynamicRouterAndClusterDif
 INSTANTIATE_TEST_SUITE_P(IpVersionsClientType, DynamicRouterAndClusterFiltersIntegrationTest,
                          GRPC_CLIENT_INTEGRATION_PARAMS,
                          GrpcClientIntegrationParamTestParams::protocolTestParamsToString);
-
-// Retrying a POST request with both buffered body and trailers must not crash in continueDoRetry()
-// when an upstream HTTP filter sends a local reply in decodeData() on the retry attempt.
-TEST_P(StaticRouterOrClusterFiltersIntegrationTest, DecodeDataLocalReplyRetryWithTrailers) {
-  autonomous_allow_incomplete_streams_ = true;
-  config_helper_.addConfigModifier(
-      [](envoy::extensions::filters::network::http_connection_manager::v3::HttpConnectionManager&
-             hcm) {
-        auto* retry_policy = hcm.mutable_route_config()
-                                 ->mutable_virtual_hosts(0)
-                                 ->mutable_routes(0)
-                                 ->mutable_route()
-                                 ->mutable_retry_policy();
-        retry_policy->set_retry_on("5xx");
-        retry_policy->mutable_num_retries()->set_value(1);
-        retry_policy->mutable_retry_back_off()->mutable_base_interval()->set_nanos(100 * 1000 *
-                                                                                   1000);
-      });
-
-  addStaticTypedConfigFilter("local-reply-during-decode",
-                             test::integration::filters::LocalReplyDuringDecodeConfig());
-  addCodecFilter();
-  initialize();
-
-  codec_client_ = makeHttpConnection(lookupPort("http"));
-  Http::TestRequestHeaderMapImpl post_headers{{":method", "POST"},
-                                              {":path", "/"},
-                                              {":scheme", "https"},
-                                              {":authority", "host"},
-                                              {"local-reply-during-data", "true"}};
-  auto encoder_decoder = codec_client_->startRequest(post_headers);
-  request_encoder_ = &encoder_decoder.first;
-  auto response = std::move(encoder_decoder.second);
-  codec_client_->sendData(*request_encoder_, "request body", false);
-  Http::TestRequestTrailerMapImpl request_trailers{{"x-req-trailer", "val"}};
-  codec_client_->sendTrailers(*request_encoder_, request_trailers);
-
-  ASSERT_TRUE(response->waitForEndStream());
-  EXPECT_TRUE(response->complete());
-  EXPECT_EQ("500", response->headers().getStatusValue());
-  cleanupUpstreamAndDownstream();
-}
 
 } // namespace
 } // namespace Envoy
