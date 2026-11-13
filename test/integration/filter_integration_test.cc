@@ -1729,5 +1729,31 @@ TEST_P(FilterIntegrationTest, EncodeMetadataOnLocalReply) {
   }
 }
 
+// When encoding the headers of a local reply fails required response header validation (sending a
+// 502 direct local reply) and that replacement reply's body exceeds the HTTP/2 initial stream
+// flow-control window, the stream stays alive waiting for WINDOW_UPDATE so state_.destroyed_ is
+// still false when encode_headers_ returns. The outer local reply must not encode its superseded
+// body afterward (which crashes ASSERT(!local_end_stream_) in the HTTP/2 codec).
+TEST_P(FilterIntegrationTest, LocalReplyWithRemoveResponseHeadersExceedingHttp2StreamWindow) {
+  if (!testing_downstream_filter_) {
+    return;
+  }
+  envoy::extensions::filters::network::http_connection_manager::v3::LocalReplyConfig
+      local_reply_config;
+  local_reply_config.mutable_body_format()->mutable_text_format_source()->set_inline_string(
+      std::string(100000, 'x'));
+  config_helper_.setLocalReply(local_reply_config);
+  prependFilter(on_local_reply_filter);
+  prependFilter(remove_response_headers_filter);
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  auto response = codec_client_->makeHeaderOnlyRequest(default_request_headers_);
+  ASSERT_TRUE(response->waitForEndStream());
+  ASSERT_TRUE(response->complete());
+  EXPECT_EQ("502", response->headers().getStatusValue());
+  EXPECT_EQ(100000U, response->body().size());
+}
+
 } // namespace
 } // namespace Envoy

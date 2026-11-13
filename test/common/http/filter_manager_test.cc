@@ -1945,6 +1945,275 @@ TEST_F(BaseFilterManagerTest, LocalReplyModifyHeadersCopyingStatusKeepsValidStat
   base_fm_->destroyFilters();
 }
 
+// When an encoder filter replaces a non-empty-body local reply with a chained sendLocalReply()
+// during encodeHeaders() and endStream() does not synchronously destroy the filters (as on
+// UpstreamRequestFilterManagerCallbacks or zombie downstream streams), the outer local reply must
+// not encode its superseded body afterward.
+TEST_F(BaseFilterManagerTest, ChainedLocalReplyInEncodeHeadersDoesNotEncodeOriginalBody) {
+  initializeBaseFilterManager();
+
+  EXPECT_CALL(*filter_1_, decodeHeaders(_, true)).WillOnce(Return(FilterHeadersStatus::Continue));
+  EXPECT_CALL(*filter_2_, decodeHeaders(_, true))
+      .WillOnce(Invoke([&](RequestHeaderMap&, bool) -> FilterHeadersStatus {
+        filter_2_->callbacks_->sendLocalReply(Code::BadRequest, "decoder_body", nullptr,
+                                              std::nullopt, "decoder_local_reply");
+        return FilterHeadersStatus::StopIteration;
+      }));
+
+  EXPECT_CALL(*filter_1_, encodeHeaders(_, false))
+      .WillOnce(Invoke([&](ResponseHeaderMap& headers, bool) -> FilterHeadersStatus {
+        EXPECT_EQ("400", headers.getStatusValue());
+        filter_1_->encoder_callbacks_->sendLocalReply(Code::ServiceUnavailable, "encoder_body",
+                                                      nullptr, std::nullopt, "encoder_local_reply");
+        return FilterHeadersStatus::StopIteration;
+      }));
+  EXPECT_CALL(*filter_1_, encodeData(_, _)).Times(0);
+
+  EXPECT_CALL(filter_manager_callbacks_, encodeHeaders(_, false))
+      .WillOnce(Invoke(
+          [](ResponseHeaderMap& headers, bool) { EXPECT_EQ("503", headers.getStatusValue()); }));
+  EXPECT_CALL(filter_manager_callbacks_, encodeData(_, true))
+      .WillOnce(
+          Invoke([](Buffer::Instance& data, bool) { EXPECT_EQ("encoder_body", data.toString()); }));
+  EXPECT_CALL(filter_manager_callbacks_, endStream());
+
+  base_fm_->decodeHeaders(*request_headers_, true);
+  base_fm_->destroyFilters();
+}
+
+// When an encoder filter resets the stream while encoding the headers of a non-empty-body local
+// reply and resetStream() does not synchronously destroy the filters, the aborted local reply body
+// must not be encoded afterward.
+TEST_F(BaseFilterManagerTest, ResetStreamInEncodeHeadersDoesNotEncodeLocalReplyBody) {
+  initializeBaseFilterManager();
+
+  EXPECT_CALL(*filter_1_, decodeHeaders(_, true)).WillOnce(Return(FilterHeadersStatus::Continue));
+  EXPECT_CALL(*filter_2_, decodeHeaders(_, true))
+      .WillOnce(Invoke([&](RequestHeaderMap&, bool) -> FilterHeadersStatus {
+        filter_2_->callbacks_->sendLocalReply(Code::BadRequest, "decoder_body", nullptr,
+                                              std::nullopt, "decoder_local_reply");
+        return FilterHeadersStatus::StopIteration;
+      }));
+
+  EXPECT_CALL(*filter_1_, encodeHeaders(_, false))
+      .WillOnce(Invoke([&](ResponseHeaderMap&, bool) -> FilterHeadersStatus {
+        filter_1_->encoder_callbacks_->resetStream();
+        return FilterHeadersStatus::StopIteration;
+      }));
+  EXPECT_CALL(filter_manager_callbacks_, resetStream(_, _));
+  EXPECT_CALL(*filter_1_, encodeData(_, _)).Times(0);
+  EXPECT_CALL(filter_manager_callbacks_, encodeData(_, _)).Times(0);
+  EXPECT_CALL(filter_manager_callbacks_, endStream()).Times(0);
+
+  base_fm_->decodeHeaders(*request_headers_, true);
+  base_fm_->destroyFilters();
+}
+
+// An encoder filter local reply in encodeHeaders(end_stream=true) whose encoding destroys the
+// filters synchronously must not invoke encodeComplete() after onDestroy().
+TEST_F(BaseFilterManagerTest, LocalReplyInEncodeHeadersDestroyingFiltersSkipsEncodeComplete) {
+  initializeBaseFilterManager();
+  destroyFiltersOnEndStream();
+
+  EXPECT_CALL(*filter_1_, decodeHeaders(_, true)).WillOnce(Return(FilterHeadersStatus::Continue));
+  EXPECT_CALL(*filter_2_, decodeHeaders(_, true)).WillOnce(Return(FilterHeadersStatus::Continue));
+  base_fm_->decodeHeaders(*request_headers_, true);
+
+  EXPECT_CALL(*filter_1_, encodeHeaders(_, true))
+      .WillOnce(Invoke([&](ResponseHeaderMap&, bool) -> FilterHeadersStatus {
+        filter_1_->encoder_callbacks_->sendLocalReply(Code::ServiceUnavailable, "", nullptr,
+                                                      std::nullopt, "encode_headers_local_reply");
+        return FilterHeadersStatus::StopIteration;
+      }));
+  EXPECT_CALL(*filter_1_, encodeComplete()).Times(0);
+  EXPECT_CALL(filter_manager_callbacks_, encodeHeaders(_, true));
+
+  ResponseHeaderMapPtr response_headers{new TestResponseHeaderMapImpl{{":status", "200"}}};
+  filter_2_->callbacks_->encodeHeaders(std::move(response_headers), true, "via_upstream");
+  EXPECT_TRUE(filters_destroyed_);
+}
+
+// An encoder filter local reply in encodeData(end_stream=true) after response headers were sent
+// resets the stream. If resetStream() synchronously destroys the filters, encodeComplete() must not
+// run after onDestroy().
+TEST_F(BaseFilterManagerTest, LocalReplyInEncodeDataDestroyingFiltersSkipsEncodeComplete) {
+  initializeBaseFilterManager();
+
+  EXPECT_CALL(*filter_1_, decodeHeaders(_, true)).WillOnce(Return(FilterHeadersStatus::Continue));
+  EXPECT_CALL(*filter_2_, decodeHeaders(_, true)).WillOnce(Return(FilterHeadersStatus::Continue));
+  base_fm_->decodeHeaders(*request_headers_, true);
+
+  EXPECT_CALL(*filter_1_, encodeHeaders(_, false)).WillOnce(Return(FilterHeadersStatus::Continue));
+  EXPECT_CALL(filter_manager_callbacks_, encodeHeaders(_, false));
+  ResponseHeaderMapPtr response_headers{new TestResponseHeaderMapImpl{{":status", "200"}}};
+  filter_2_->callbacks_->encodeHeaders(std::move(response_headers), false, "via_upstream");
+
+  EXPECT_CALL(*filter_1_, onDestroy()).WillOnce(Invoke([this]() { filters_destroyed_ = true; }));
+  EXPECT_CALL(*filter_2_, onDestroy()).WillOnce(Invoke([this]() { filters_destroyed_ = true; }));
+  EXPECT_CALL(filter_manager_callbacks_, resetStream(_, _))
+      .WillOnce(
+          Invoke([this](StreamResetReason, absl::string_view) { base_fm_->destroyFilters(); }));
+  EXPECT_CALL(*filter_1_, encodeData(_, true))
+      .WillOnce(Invoke([&](Buffer::Instance&, bool) -> FilterDataStatus {
+        filter_1_->encoder_callbacks_->sendLocalReply(Code::InternalServerError, "body_error",
+                                                      nullptr, std::nullopt, "encode_data_error");
+        return FilterDataStatus::StopIterationNoBuffer;
+      }));
+  EXPECT_CALL(*filter_1_, encodeComplete()).Times(0);
+  EXPECT_CALL(filter_manager_callbacks_, encodeData(_, _)).Times(0);
+
+  Buffer::OwnedImpl response_body("ok_body");
+  filter_2_->callbacks_->encodeData(response_body, true);
+  EXPECT_TRUE(filters_destroyed_);
+}
+
+// An encoder filter local reply in encodeTrailers() resets the stream and aborts trailer encoding.
+// If resetStream() synchronously destroys the filters, encodeComplete() and encodeTrailers() must
+// not run afterward, even if the filter returns Continue.
+TEST_F(BaseFilterManagerTest, LocalReplyInEncodeTrailersDestroyingFiltersSkipsPostDestroyCalls) {
+  initializeBaseFilterManager();
+
+  EXPECT_CALL(*filter_1_, decodeHeaders(_, true)).WillOnce(Return(FilterHeadersStatus::Continue));
+  EXPECT_CALL(*filter_2_, decodeHeaders(_, true)).WillOnce(Return(FilterHeadersStatus::Continue));
+  base_fm_->decodeHeaders(*request_headers_, true);
+
+  EXPECT_CALL(*filter_1_, encodeHeaders(_, false)).WillOnce(Return(FilterHeadersStatus::Continue));
+  EXPECT_CALL(filter_manager_callbacks_, encodeHeaders(_, false));
+  ResponseHeaderMapPtr response_headers{new TestResponseHeaderMapImpl{{":status", "200"}}};
+  filter_2_->callbacks_->encodeHeaders(std::move(response_headers), false, "via_upstream");
+
+  EXPECT_CALL(*filter_1_, encodeData(_, false)).WillOnce(Return(FilterDataStatus::Continue));
+  EXPECT_CALL(filter_manager_callbacks_, encodeData(_, false));
+  Buffer::OwnedImpl response_body("ok_body");
+  filter_2_->callbacks_->encodeData(response_body, false);
+
+  EXPECT_CALL(*filter_1_, onDestroy()).WillOnce(Invoke([this]() { filters_destroyed_ = true; }));
+  EXPECT_CALL(*filter_2_, onDestroy()).WillOnce(Invoke([this]() { filters_destroyed_ = true; }));
+  EXPECT_CALL(filter_manager_callbacks_, resetStream(_, _))
+      .WillOnce(
+          Invoke([this](StreamResetReason, absl::string_view) { base_fm_->destroyFilters(); }));
+  EXPECT_CALL(*filter_1_, encodeTrailers(_))
+      .WillOnce(Invoke([&](ResponseTrailerMap&) -> FilterTrailersStatus {
+        filter_1_->encoder_callbacks_->sendLocalReply(Code::InternalServerError, "trailer_error",
+                                                      nullptr, std::nullopt,
+                                                      "encode_trailers_error");
+        return FilterTrailersStatus::Continue;
+      }));
+  EXPECT_CALL(*filter_1_, encodeComplete()).Times(0);
+  EXPECT_CALL(filter_manager_callbacks_, encodeTrailers(_)).Times(0);
+  EXPECT_CALL(filter_manager_callbacks_, endStream()).Times(0);
+
+  ResponseTrailerMapPtr response_trailers{new TestResponseTrailerMapImpl{{"x-trailer", "1"}}};
+  ON_CALL(filter_manager_callbacks_, responseTrailers())
+      .WillByDefault(Return(makeOptRef(*response_trailers)));
+  filter_2_->callbacks_->encodeTrailers(std::move(response_trailers));
+  EXPECT_TRUE(filters_destroyed_);
+}
+
+// If an encoder filter injects body data during encodeHeaders(end_stream=true) and
+// filter_manager_callbacks_.encodeHeaders() synchronously destroys the filters (for example when
+// Router::Filter retries a 503 response without setting saw_downstream_reset_), FilterManager must
+// not continue encoding the buffered body after onDestroy().
+TEST_F(BaseFilterManagerTest, DestroyDuringEncodeHeadersCallbackSkipsBodyContinuation) {
+  initializeBaseFilterManager();
+
+  EXPECT_CALL(*filter_1_, decodeHeaders(_, true)).WillOnce(Return(FilterHeadersStatus::Continue));
+  EXPECT_CALL(*filter_2_, decodeHeaders(_, true)).WillOnce(Return(FilterHeadersStatus::Continue));
+  base_fm_->decodeHeaders(*request_headers_, true);
+
+  EXPECT_CALL(*filter_1_, encodeHeaders(_, true))
+      .WillOnce(Invoke([&](ResponseHeaderMap& headers, bool) -> FilterHeadersStatus {
+        Buffer::OwnedImpl injected("injected_body");
+        filter_1_->encoder_callbacks_->addEncodedData(injected, false);
+        headers.setContentLength(injected.length());
+        return FilterHeadersStatus::Continue;
+      }));
+  EXPECT_CALL(*filter_1_, onDestroy()).WillOnce(Invoke([this]() { filters_destroyed_ = true; }));
+  EXPECT_CALL(*filter_2_, onDestroy()).WillOnce(Invoke([this]() { filters_destroyed_ = true; }));
+  EXPECT_CALL(filter_manager_callbacks_, encodeHeaders(_, false))
+      .WillOnce(Invoke([this](ResponseHeaderMap&, bool) { base_fm_->destroyFilters(); }));
+  EXPECT_CALL(filter_manager_callbacks_, encodeData(_, _)).Times(0);
+
+  ResponseHeaderMapPtr response_headers{new TestResponseHeaderMapImpl{{":status", "503"}}};
+  filter_2_->callbacks_->encodeHeaders(std::move(response_headers), true, "via_upstream");
+  EXPECT_TRUE(filters_destroyed_);
+}
+
+// If a filter prepares a local reply during a decoder callback and then calls sendLocalReply() a
+// second time and resets the stream before returning, the duplicate local reply must be ignored and
+// resetting must clear the prepared local reply so it is never encoded afterward.
+TEST_F(BaseFilterManagerTest, PreparedLocalReplyClearedOnResetAndDuplicateLocalReplyIgnored) {
+  initializeBaseFilterManager();
+
+  EXPECT_CALL(*filter_1_, decodeHeaders(_, true)).WillOnce(Return(FilterHeadersStatus::Continue));
+  EXPECT_CALL(*filter_2_, decodeHeaders(_, true))
+      .WillOnce(Invoke([&](RequestHeaderMap&, bool) -> FilterHeadersStatus {
+        filter_2_->callbacks_->sendLocalReply(Code::ServiceUnavailable, "first", nullptr,
+                                              std::nullopt, "first_details");
+        filter_2_->callbacks_->sendLocalReply(Code::BadGateway, "second", nullptr, std::nullopt,
+                                              "second_details");
+        filter_2_->callbacks_->resetStream(StreamResetReason::LocalReset, "");
+        return FilterHeadersStatus::StopIteration;
+      }));
+  EXPECT_CALL(stream_info_, setResponseCodeDetails(absl::string_view("first_details")));
+  EXPECT_CALL(stream_info_, setResponseCodeDetails(absl::string_view("second_details"))).Times(0);
+  EXPECT_CALL(*filter_1_, onLocalReply(_)).WillOnce(Return(LocalErrorStatus::Continue));
+  EXPECT_CALL(*filter_2_, onLocalReply(_)).WillOnce(Return(LocalErrorStatus::Continue));
+  EXPECT_CALL(filter_manager_callbacks_, resetStream(StreamResetReason::LocalReset, ""));
+  EXPECT_CALL(*filter_1_, encodeHeaders(_, _)).Times(0);
+
+  base_fm_->decodeHeaders(*request_headers_, true);
+  base_fm_->destroyFilters();
+}
+
+// If encode1xxHeaders() synchronously destroys the filters during a filter callback without setting
+// encoder_filter_chain_aborted_, FilterManager must not forward the 1xx headers to callbacks after
+// onDestroy().
+TEST_F(BaseFilterManagerTest, Encode1xxHeadersSkipsCodecCallbackWhenDestroyed) {
+  initializeBaseFilterManager();
+
+  EXPECT_CALL(*filter_1_, decodeHeaders(_, true)).WillOnce(Return(FilterHeadersStatus::Continue));
+  EXPECT_CALL(*filter_2_, decodeHeaders(_, true)).WillOnce(Return(FilterHeadersStatus::Continue));
+  base_fm_->decodeHeaders(*request_headers_, true);
+
+  EXPECT_CALL(*filter_1_, encode1xxHeaders(_))
+      .WillOnce(Invoke([this](ResponseHeaderMap&) -> Filter1xxHeadersStatus {
+        base_fm_->destroyFilters();
+        return Filter1xxHeadersStatus::Continue;
+      }));
+  EXPECT_CALL(*filter_1_, onDestroy()).WillOnce(Invoke([this]() { filters_destroyed_ = true; }));
+  EXPECT_CALL(*filter_2_, onDestroy()).WillOnce(Invoke([this]() { filters_destroyed_ = true; }));
+  EXPECT_CALL(filter_manager_callbacks_, encode1xxHeaders(_)).Times(0);
+
+  ResponseHeaderMapPtr info_headers{new TestResponseHeaderMapImpl{{":status", "100"}}};
+  filter_2_->callbacks_->encode1xxHeaders(std::move(info_headers));
+  EXPECT_TRUE(filters_destroyed_);
+}
+
+// Calling continueEncoding() on a paused encoder filter after destroyFilters() has run must be a
+// no-op even when saw_downstream_reset_ was not set.
+TEST_F(BaseFilterManagerTest, ContinueEncodingNoOpAfterDestroy) {
+  initializeBaseFilterManager();
+
+  EXPECT_CALL(*filter_1_, decodeHeaders(_, true)).WillOnce(Return(FilterHeadersStatus::Continue));
+  EXPECT_CALL(*filter_2_, decodeHeaders(_, true)).WillOnce(Return(FilterHeadersStatus::Continue));
+  base_fm_->decodeHeaders(*request_headers_, true);
+
+  EXPECT_CALL(*filter_1_, encodeHeaders(_, true))
+      .WillOnce(Return(FilterHeadersStatus::StopIteration));
+  EXPECT_CALL(filter_manager_callbacks_, encodeHeaders(_, _)).Times(0);
+
+  ResponseHeaderMapPtr response_headers{new TestResponseHeaderMapImpl{{":status", "200"}}};
+  filter_2_->callbacks_->encodeHeaders(std::move(response_headers), true, "via_upstream");
+
+  EXPECT_CALL(*filter_1_, onDestroy()).WillOnce(Invoke([this]() { filters_destroyed_ = true; }));
+  EXPECT_CALL(*filter_2_, onDestroy()).WillOnce(Invoke([this]() { filters_destroyed_ = true; }));
+  base_fm_->destroyFilters();
+  EXPECT_TRUE(filters_destroyed_);
+
+  filter_1_->encoder_callbacks_->continueEncoding();
+}
+
 } // namespace
 } // namespace Http
 } // namespace Envoy
