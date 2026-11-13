@@ -782,7 +782,7 @@ Http::FilterHeadersStatus Filter::decodeHeaders(Http::RequestHeaderMap& headers,
       ENVOY_STREAM_LOG(debug, "Continuing stream now that host resolution is complete\n",
                        *callbacks_);
       callbacks_->continueDecoding();
-    } else {
+    } else if (!destroyed_) {
       ENVOY_STREAM_LOG(debug, "Aborting stream after host resolution is complete\n", *callbacks_);
     }
   });
@@ -919,6 +919,9 @@ bool Filter::continueDecodeHeaders(Http::RequestHeaderMap& headers, bool end_str
       static_cast<bool>(upstream_half_close_enabled_) /*enable_half_close*/);
   LinkedList::moveIntoList(std::move(upstream_request), upstream_requests_);
   upstream_requests_.front()->acceptHeadersFromRouter(end_stream);
+  if (destroyed_) {
+    return false;
+  }
 
   // An upstream HTTP filter local reply that is not retried completes the downstream response and
   // cleans up the upstream request before acceptHeadersFromRouter() returns.
@@ -1174,7 +1177,8 @@ Http::FilterDataStatus Filter::decodeData(Buffer::Instance& data, bool end_strea
   const bool redirect_enabled = route_entry_ && route_entry_->internalRedirectPolicy().enabled();
   const uint64_t effective_buffer_limit = calculateEffectiveBufferLimit();
 
-  bool buffering = (retry_enabled || redirect_enabled) && (!request_buffer_overflowed_);
+  bool buffering = (retry_enabled || redirect_enabled) && (!request_buffer_overflowed_) &&
+                   !responseCompletedWithoutUpstreamRequest();
 
   // Check if we would exceed buffer limits, regardless of current buffering state
   // This ensures error details are set even if retry state was cleared due to upstream reset.
@@ -1435,6 +1439,7 @@ void Filter::onRequestComplete() {
 }
 
 void Filter::onDestroy() {
+  destroyed_ = true;
   // Cancel any in-flight host selection
   if (host_selection_cancelable_) {
     host_selection_cancelable_->cancel();
@@ -1463,34 +1468,38 @@ void Filter::onResponseTimeout() {
 
     // We want to record the upstream timeouts and increase the stats counters in all the cases.
     // For example, we also want to record the stats in the case of BiDi streaming APIs where we
-    // might have already seen the headers.
-    cluster_->trafficStats()->upstream_rq_timeout_.inc();
-    if (request_vcluster_) {
-      request_vcluster_->stats().upstream_rq_timeout_.inc();
-    }
-    if (route_stats_context_.has_value()) {
-      route_stats_context_->stats().upstream_rq_timeout_.inc();
-    }
-
-    if (upstream_request->upstreamHost()) {
-      upstream_request->upstreamHost()->stats().rq_timeout_.inc();
-    }
-
-    if (upstream_request->awaitingHeaders()) {
-      if (cluster_->timeoutBudgetStats().has_value()) {
-        // Cancel firing per-try timeout information, because the per-try timeout did not come into
-        // play when the global timeout was hit.
-        upstream_request->recordTimeoutBudget(false);
+    // might have already seen the headers. An upstream HTTP filter local reply never reached the
+    // upstream host, so do not attribute a timeout to the host or cluster when an encoder filter
+    // pauses that local reply until the route timeout fires.
+    if (!upstream_request->sentLocalReply()) {
+      cluster_->trafficStats()->upstream_rq_timeout_.inc();
+      if (request_vcluster_) {
+        request_vcluster_->stats().upstream_rq_timeout_.inc();
+      }
+      if (route_stats_context_.has_value()) {
+        route_stats_context_->stats().upstream_rq_timeout_.inc();
       }
 
-      // If this upstream request already hit a "soft" timeout, then it
-      // already recorded a timeout into outlier detection. Don't do it again.
-      if (!upstream_request->outlierDetectionTimeoutRecorded()) {
-        updateOutlierDetection(Upstream::Outlier::Result::LocalOriginTimeout, *upstream_request,
-                               std::optional<uint64_t>(enumToInt(timeout_response_code_)));
+      if (upstream_request->upstreamHost()) {
+        upstream_request->upstreamHost()->stats().rq_timeout_.inc();
       }
 
-      chargeUpstreamAbort(timeout_response_code_, false, *upstream_request);
+      if (upstream_request->awaitingHeaders()) {
+        if (cluster_->timeoutBudgetStats().has_value()) {
+          // Cancel firing per-try timeout information, because the per-try timeout did not come
+          // into play when the global timeout was hit.
+          upstream_request->recordTimeoutBudget(false);
+        }
+
+        // If this upstream request already hit a "soft" timeout, then it
+        // already recorded a timeout into outlier detection. Don't do it again.
+        if (!upstream_request->outlierDetectionTimeoutRecorded()) {
+          updateOutlierDetection(Upstream::Outlier::Result::LocalOriginTimeout, *upstream_request,
+                                 std::optional<uint64_t>(enumToInt(timeout_response_code_)));
+        }
+
+        chargeUpstreamAbort(timeout_response_code_, false, *upstream_request);
+      }
     }
     upstream_request->resetStream();
   }
@@ -1556,21 +1565,27 @@ void Filter::onPerTryTimeoutCommon(UpstreamRequest& upstream_request, Stats::Cou
     return;
   }
 
-  error_counter.inc();
-  if (upstream_request.upstreamHost()) {
-    upstream_request.upstreamHost()->stats().rq_timeout_.inc();
+  if (!upstream_request.sentLocalReply()) {
+    error_counter.inc();
+    if (upstream_request.upstreamHost()) {
+      upstream_request.upstreamHost()->stats().rq_timeout_.inc();
+    }
   }
 
   upstream_request.resetStream();
 
-  updateOutlierDetection(Upstream::Outlier::Result::LocalOriginTimeout, upstream_request,
-                         std::optional<uint64_t>(enumToInt(timeout_response_code_)));
+  if (!upstream_request.sentLocalReply()) {
+    updateOutlierDetection(Upstream::Outlier::Result::LocalOriginTimeout, upstream_request,
+                           std::optional<uint64_t>(enumToInt(timeout_response_code_)));
+  }
 
   if (maybeRetryReset(Http::StreamResetReason::LocalReset, upstream_request, TimeoutRetry::Yes)) {
     return;
   }
 
-  chargeUpstreamAbort(timeout_response_code_, false, upstream_request);
+  if (!upstream_request.sentLocalReply()) {
+    chargeUpstreamAbort(timeout_response_code_, false, upstream_request);
+  }
 
   // Remove this upstream request from the list now that we're done with it.
   upstream_request.removeFromList(upstream_requests_);
@@ -2145,9 +2160,11 @@ void Filter::onUpstreamHeaders(uint64_t response_code, Http::ResponseHeaderMapPt
   // rather than whether details are set. The upstream request is only deferred-deleted, so its
   // details stay valid through encodeHeaders() below.
   absl::string_view details = StreamInfo::ResponseCodeDetails::get().ViaUpstream;
-  if (upstream_filter_local_reply &&
-      upstream_request.streamInfo().responseCodeDetails().has_value()) {
-    details = *upstream_request.streamInfo().responseCodeDetails();
+  if (upstream_filter_local_reply) {
+    if (upstream_request.streamInfo().responseCodeDetails().has_value()) {
+      details = *upstream_request.streamInfo().responseCodeDetails();
+    }
+    upstream_request.copyLocalReplyStreamInfoToDownstream(callbacks_->streamInfo());
   }
   callbacks_->streamInfo().setResponseCodeDetails(details);
 
@@ -2231,7 +2248,9 @@ void Filter::onUpstreamTrailers(Http::ResponseTrailerMapPtr&& trailers,
     }
   }
 
-  maybeProcessOrcaLoadReport(*trailers, upstream_request);
+  if (!upstream_request.sentLocalReply()) {
+    maybeProcessOrcaLoadReport(*trailers, upstream_request);
+  }
 
   onUpstreamComplete(upstream_request);
 
@@ -2641,7 +2660,8 @@ void Filter::continueDoRetry(bool can_send_early_data, bool can_use_http3,
                                                                  downstream_end_stream_);
     }
 
-    if (downstream_trailers_) {
+    if (!upstream_requests_.empty() && (upstream_requests_.front().get() == upstream_request_tmp) &&
+        downstream_trailers_) {
       upstream_requests_.front()->acceptTrailersFromRouter(*downstream_trailers_);
     }
   }

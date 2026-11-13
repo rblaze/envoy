@@ -35,6 +35,7 @@
 #include "source/common/router/debug_config.h"
 #include "source/common/router/router.h"
 #include "source/common/router/upstream_codec_filter.h"
+#include "source/common/runtime/runtime_features.h"
 #include "source/common/stream_info/uint32_accessor_impl.h"
 #include "source/common/tracing/http_tracer_impl.h"
 #include "source/extensions/common/proxy_protocol/proxy_protocol_header.h"
@@ -84,6 +85,15 @@ public:
       return;
     }
     upstream_request_.sent_local_reply_ = true;
+    if (upstream_request_.per_try_timeout_ != nullptr) {
+      upstream_request_.per_try_timeout_->disableTimer();
+    }
+    if (upstream_request_.per_try_idle_timeout_ != nullptr) {
+      upstream_request_.per_try_idle_timeout_->disableTimer();
+    }
+    if (upstream_request_.max_stream_duration_timer_ != nullptr) {
+      upstream_request_.max_stream_duration_timer_->disableTimer();
+    }
     // The router handles the local reply like an upstream response and expects a host. If no host
     // has been selected yet, attribute the reply to the connection pool's host. `pool_success` is
     // false so that only retry_state_->onHostAttempted() runs: retry host predicates (for example
@@ -95,9 +105,11 @@ public:
     }
     Http::FilterManager::sendLocalReply(code, body, modify_headers, grpc_status, details);
   }
-  // Returns true if the decoder filter chain should stop (local reply sent or downstream reset).
+  // Returns true if the decoder filter chain should stop (local reply sent, filter chain destroyed,
+  // or downstream reset).
   bool isAborted() {
-    return state().decoder_filter_chain_aborted_ || state().saw_downstream_reset_;
+    return state().destroyed_ || state().decoder_filter_chain_aborted_ ||
+           state().saw_downstream_reset_;
   }
   // Notifies all upstream callbacks that a host has been selected, returning true if the request
   // was aborted by one of them.
@@ -115,8 +127,35 @@ public:
       state().filter_call_state_ |= Http::FilterManager::FilterCallState::DecodeHeaders;
       callback->onHostSelected(host);
       state().filter_call_state_ &= ~Http::FilterManager::FilterCallState::DecodeHeaders;
-      if (isAborted()) {
-        executeLocalReplyIfPrepared();
+      if (isAborted() || upstream_request_.cleaned_up_) {
+        if (!upstream_request_.cleaned_up_) {
+          executeLocalReplyIfPrepared();
+        }
+        return true;
+      }
+    }
+    return false;
+  }
+  // Notifies all upstream callbacks that the upstream connection has been established, returning
+  // true if the request was aborted by one of them.
+  bool notifyUpstreamConnectionEstablished() {
+    for (auto* callback : upstream_request_.upstream_callbacks_) {
+      // Treat onUpstreamConnectionEstablished() like a decoder callback when not already inside
+      // one, so a local reply sent from an asynchronous onPoolReady() is prepared and only encoded
+      // once the callback returns.
+      const bool set_decode_headers_state =
+          !(state().filter_call_state_ & Http::FilterManager::FilterCallState::DecodeHeaders);
+      if (set_decode_headers_state) {
+        state().filter_call_state_ |= Http::FilterManager::FilterCallState::DecodeHeaders;
+      }
+      callback->onUpstreamConnectionEstablished();
+      if (set_decode_headers_state) {
+        state().filter_call_state_ &= ~Http::FilterManager::FilterCallState::DecodeHeaders;
+      }
+      if (isAborted() || upstream_request_.cleaned_up_) {
+        if (set_decode_headers_state && !upstream_request_.cleaned_up_) {
+          executeLocalReplyIfPrepared();
+        }
         return true;
       }
     }
@@ -125,12 +164,17 @@ public:
   UpstreamRequest& upstream_request_;
 
 protected:
-  // Upstream filter local replies record their response code details on the upstream stream info
-  // only. They are copied to the downstream stream info when the router forwards the reply, or by
+  // Upstream filter local replies record their response code details and LocalReplyOwner on the
+  // upstream stream info only when routed through the upstream filter chain. They are copied to the
+  // downstream stream info when the router forwards the reply, or by
   // UpstreamRequestFilterManagerCallbacks::resetStream() when the reply resets the stream instead.
-  // That way a local reply that is retried does not leave stale details on the downstream stream.
-  void setLocalReplyResponseCodeDetails(absl::string_view details) override {
-    upstream_request_.streamInfo().setResponseCodeDetails(details);
+  // That way a local reply that is retried does not leave stale state on the downstream stream.
+  StreamInfo::StreamInfo& localReplyStreamInfo() override {
+    if (Runtime::runtimeFeatureEnabled(
+            "envoy.reloadable_features.upstream_filter_local_reply_via_upstream_filter_chain")) {
+      return upstream_request_.streamInfo();
+    }
+    return streamInfo();
   }
 };
 
@@ -264,8 +308,9 @@ void UpstreamRequest::cleanUp() {
   clearRequestEncoder();
 
   // If desired, fire the per-try histogram when the UpstreamRequest
-  // completes.
-  if (record_timeout_budget_) {
+  // completes. An upstream filter local reply never reached the upstream host,
+  // so skip recording the per-try timeout budget for it.
+  if (record_timeout_budget_ && !sent_local_reply_) {
     Event::Dispatcher& dispatcher = parent_.callbacks()->dispatcher();
     const MonotonicTime end_time = dispatcher.timeSource().monotonicTime();
     const std::chrono::milliseconds response_time =
@@ -513,8 +558,9 @@ void UpstreamRequest::acceptHeadersFromRouter(bool end_stream) {
   // The connection pool can fail synchronously, e.g. when a circuit breaker overflows,
   // which resets this request and schedules it for deferred deletion before newStream()
   // returns. Deferred deletion synchronously runs deleteIsPending() -> cleanUp(), destroying
-  // the upstream HTTP filter chain. Do not drive the destroyed filter chain any further.
-  if (cleaned_up_) {
+  // the upstream HTTP filter chain. Likewise, a synchronous onPoolReady() can abort the request
+  // during onUpstreamConnectionEstablished(). Do not drive the filter chain any further.
+  if (cleaned_up_ || upstream_fm->isAborted()) {
     ENVOY_STREAM_LOG(debug, "upstream request aborted during connection pool newStream",
                      *parent_.callbacks());
     return;
@@ -592,9 +638,11 @@ void UpstreamRequest::resetStream() {
     ASSERT(!upstream_);
   }
 
-  // Don't reset the stream if we're already done with it.
+  // Don't reset the stream if we're already done with it, though still release the upstream
+  // encoder and watermark subscriptions.
   if (upstreamTiming().last_upstream_tx_byte_sent_.has_value() &&
       upstreamTiming().last_upstream_rx_byte_received_.has_value()) {
+    clearRequestEncoder();
     return;
   }
 
@@ -612,7 +660,7 @@ void UpstreamRequest::resetStream() {
 }
 
 void UpstreamRequest::resetPerTryIdleTimer() {
-  if (per_try_idle_timeout_ != nullptr) {
+  if (per_try_idle_timeout_ != nullptr && !sent_local_reply_) {
     per_try_idle_timeout_->enableTimer(parent_.timeout().per_try_idle_timeout_);
   }
 }
@@ -624,6 +672,9 @@ void UpstreamRequest::resetUpstreamLogFlushTimer() {
 }
 
 void UpstreamRequest::setupPerTryTimeout() {
+  if (sent_local_reply_) {
+    return;
+  }
   ASSERT(!per_try_timeout_);
   if (parent_.timeout().per_try_timeout_.count() > 0) {
     per_try_timeout_ =
@@ -817,8 +868,10 @@ void UpstreamRequest::onPoolReady(std::unique_ptr<GenericUpstream>&& upstream,
               stream_info_.downstreamAddressProvider().connectionID().value());
   }
 
-  for (auto* callback : upstream_callbacks_) {
-    callback->onUpstreamConnectionEstablished();
+  auto* upstream_fm = static_cast<UpstreamFilterManager*>(filter_manager_.get());
+  if (upstream_fm->notifyUpstreamConnectionEstablished()) {
+    ENVOY_LOG(debug, "upstream request aborted during onUpstreamConnectionEstablished");
+    return;
   }
 }
 
@@ -928,6 +981,22 @@ Tracing::Span& UpstreamRequestFilterManagerCallbacks::activeSpan() {
   return upstream_request_.parent_.callbacks()->activeSpan();
 }
 
+void UpstreamRequest::copyLocalReplyStreamInfoToDownstream(
+    StreamInfo::StreamInfo& downstream_stream_info) {
+  if (stream_info_.filterState()->hasIndexedData(StreamInfo::FilterStateIndex::LocalReplyOwner) &&
+      !downstream_stream_info.filterState()->hasIndexedData(
+          StreamInfo::FilterStateIndex::LocalReplyOwner)) {
+    downstream_stream_info.filterState()->setIndexedData(
+        StreamInfo::FilterStateIndex::LocalReplyOwner,
+        stream_info_.filterState()->getIndexedDataSharedMutableGeneric(
+            StreamInfo::FilterStateIndex::LocalReplyOwner),
+        StreamInfo::FilterState::LifeSpan::FilterChain);
+  }
+  if (stream_info_.hasResponseFlag(StreamInfo::CoreResponseFlag::DownstreamProtocolError)) {
+    downstream_stream_info.setResponseFlag(StreamInfo::CoreResponseFlag::DownstreamProtocolError);
+  }
+}
+
 void UpstreamRequestFilterManagerCallbacks::resetStream(
     Http::StreamResetReason reset_reason, absl::string_view transport_failure_reason) {
   // The filter manager needs to disambiguate between a filter-driven reset,
@@ -938,12 +1007,14 @@ void UpstreamRequestFilterManagerCallbacks::resetStream(
   if (reset_reason == Http::StreamResetReason::LocalReset && !is_codec_error) {
     // An upstream filter local reply resets the stream instead of reaching the router when the
     // response has already started, or when a filter asks for a reset in onLocalReply(). The router
-    // would otherwise copy the local reply's details to the downstream stream, so do it here.
+    // would otherwise copy the local reply's metadata to the downstream stream, so do it here.
     if (upstream_request_.sentLocalReply()) {
+      auto& downstream_info = upstream_request_.parent_.callbacks()->streamInfo();
       const auto& details = upstream_request_.streamInfo().responseCodeDetails();
       if (details.has_value()) {
-        upstream_request_.parent_.callbacks()->streamInfo().setResponseCodeDetails(*details);
+        downstream_info.setResponseCodeDetails(*details);
       }
+      upstream_request_.copyLocalReplyStreamInfoToDownstream(downstream_info);
     }
     upstream_request_.parent_.callbacks()->resetStream();
     return;

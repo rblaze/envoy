@@ -5,6 +5,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "envoy/extensions/filters/http/upstream_codec/v3/upstream_codec.pb.h"
 #include "envoy/extensions/filters/http/upstream_codec/v3/upstream_codec.pb.validate.h"
@@ -178,6 +179,10 @@ public:
   // the router does not count it toward host health, outlier detection, or upstream stats, and
   // keeps the filter's response code details. It can still be retried.
   bool sentLocalReply() const { return sent_local_reply_; }
+  // Copies local-reply metadata recorded on the upstream StreamInfo (LocalReplyOwner and
+  // DownstreamProtocolError) to the downstream StreamInfo when the local reply is forwarded or
+  // resets the downstream stream.
+  void copyLocalReplyStreamInfoToDownstream(StreamInfo::StreamInfo& downstream_stream_info);
   // Disable per-try timeouts for websocket upgrades after successful handshake
   void disablePerTryTimeoutForWebsocketUpgrade();
 
@@ -222,6 +227,10 @@ private:
   // access logging is configured.
   Http::ResponseHeaderMapPtr upstream_headers_;
   Http::ResponseTrailerMapPtr upstream_trailers_;
+  // Retains headers or trailers superseded by an upstream filter local reply until this
+  // UpstreamRequest is destroyed, avoiding use-after-free while an encoder filter callback is
+  // still on the stack.
+  std::vector<Http::HeaderMapPtr> overwritten_headers_;
   OptRef<UpstreamToDownstream> upstream_interface_;
   std::list<Http::UpstreamCallbacks*> upstream_callbacks_;
 
@@ -305,12 +314,21 @@ public:
     trailers_ = std::move(request_trailers);
   }
   void setInformationalHeaders(Http::ResponseHeaderMapPtr&& response_headers) override {
+    if (informational_headers_ != nullptr) {
+      upstream_request_.overwritten_headers_.push_back(std::move(informational_headers_));
+    }
     informational_headers_ = std::move(response_headers);
   }
   void setResponseHeaders(Http::ResponseHeaderMapPtr&& response_headers) override {
+    if (response_headers_ != nullptr) {
+      upstream_request_.overwritten_headers_.push_back(std::move(response_headers_));
+    }
     response_headers_ = std::move(response_headers);
   }
   void setResponseTrailers(Http::ResponseTrailerMapPtr&& response_trailers) override {
+    if (response_trailers_ != nullptr) {
+      upstream_request_.overwritten_headers_.push_back(std::move(response_trailers_));
+    }
     response_trailers_ = std::move(response_trailers);
   }
   Http::RequestHeaderMapOptRef requestHeaders() override;

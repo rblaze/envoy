@@ -87,7 +87,14 @@ Http::FilterHeadersStatus UpstreamCodecFilter::decodeHeaders(Http::RequestHeader
   if (!status.ok() || deferred_reset_.has_value()) {
     // It is possible that encodeHeaders() fails. This can happen if filters or other extensions
     // erroneously remove required headers.
-    callbacks_->streamInfo().setResponseFlag(StreamInfo::CoreResponseFlag::DownstreamProtocolError);
+    if (Runtime::runtimeFeatureEnabled(
+            "envoy.reloadable_features.upstream_filter_local_reply_via_upstream_filter_chain")) {
+      callbacks_->upstreamCallbacks()->upstreamStreamInfo().setResponseFlag(
+          StreamInfo::CoreResponseFlag::DownstreamProtocolError);
+    } else {
+      callbacks_->streamInfo().setResponseFlag(
+          StreamInfo::CoreResponseFlag::DownstreamProtocolError);
+    }
     const std::string details =
         !deferred_reset_.has_value()
             ? absl::StrCat(

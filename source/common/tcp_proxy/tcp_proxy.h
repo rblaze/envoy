@@ -579,8 +579,23 @@ public:
     Event::Dispatcher& dispatcher() override {
       return parent_->read_callbacks_->connection().dispatcher();
     }
-    void resetStream(Http::StreamResetReason, absl::string_view) override {
-      IS_ENVOY_BUG("Not implemented. Unexpected call to resetStream()");
+    void resetStream(Http::StreamResetReason reset_reason,
+                     absl::string_view transport_failure_reason) override {
+      if (reset_reason != Http::StreamResetReason::LocalReset ||
+          (parent_->generic_conn_pool_ == nullptr && parent_->upstream_ == nullptr)) {
+        IS_ENVOY_BUG("Not implemented. Unexpected call to resetStream()");
+        return;
+      }
+      if (parent_->connecting_) {
+        Upstream::HostDescriptionConstSharedPtr host =
+            parent_->getStreamInfo().upstreamInfo()
+                ? parent_->getStreamInfo().upstreamInfo()->upstreamHost()
+                : parent_->read_callbacks_->upstreamHost();
+        parent_->onGenericPoolFailure(ConnectionPool::PoolFailureReason::LocalConnectionFailure,
+                                      transport_failure_reason, host);
+      } else {
+        parent_->onUpstreamEvent(Network::ConnectionEvent::LocalClose);
+      }
     };
     OptRef<const Router::Route> route() override { return makeOptRefFromPtr(route_.get()); }
     Router::RouteConstSharedPtr routeSharedPtr() override { return route_; }
