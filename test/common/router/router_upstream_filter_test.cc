@@ -1381,10 +1381,10 @@ TEST_F(RouterUpstreamFilterTest, LocalReplyOwnerIsolatedOnRetryAndCopiedWhenForw
 
   ASSERT_TRUE(callbacks_.stream_info_.filterState()->hasIndexedData(
       StreamInfo::FilterStateIndex::LocalReplyOwner));
-  EXPECT_EQ("attempt_2_filter", callbacks_.stream_info_.filterState()
-                                    ->getIndexedDataReadOnlyGeneric(
-                                        StreamInfo::FilterStateIndex::LocalReplyOwner)
-                                    ->serializeAsString());
+  EXPECT_EQ("attempt_2_filter",
+            callbacks_.stream_info_.filterState()
+                ->getIndexedDataReadOnlyGeneric(StreamInfo::FilterStateIndex::LocalReplyOwner)
+                ->serializeAsString());
 }
 
 // Once a non-retried upstream filter local reply in decodeHeaders(end_stream=false) has completed

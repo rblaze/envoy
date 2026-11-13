@@ -298,7 +298,8 @@ void HttpUpstream::resetEncoder(Network::ConnectionEvent event, bool inform_down
   // If we did not receive a valid CONNECT response yet we treat this as a pool
   // failure, otherwise we forward the event downstream.
   if (conn_pool_callbacks_ != nullptr) {
-    conn_pool_callbacks_->onFailure();
+    auto callbacks = std::move(conn_pool_callbacks_);
+    callbacks->onFailure();
     return;
   }
 
@@ -433,6 +434,12 @@ HttpConnPool::~HttpConnPool() {
   }
 }
 
+void HttpConnPool::deleteIsPending() {
+  if (combined_upstream_ != nullptr) {
+    combined_upstream_->deleteIsPending();
+  }
+}
+
 void HttpConnPool::newStream(GenericConnectionPoolCallbacks& callbacks) {
   callbacks_ = &callbacks;
   if (Runtime::runtimeFeatureEnabled(
@@ -466,11 +473,11 @@ void HttpConnPool::onPoolFailure(ConnectionPool::PoolFailureReason reason,
 
 void HttpConnPool::onUpstreamHostSelected(Upstream::HostDescriptionConstSharedPtr host,
                                           bool pool_success) {
+  combined_upstream_->setConnPoolCallbacks(std::make_unique<HttpConnPool::Callbacks>(
+      *this, host, downstream_info_.downstreamAddressProvider().sslConnection()));
   if (!pool_success) {
     return;
   }
-  combined_upstream_->setConnPoolCallbacks(std::make_unique<HttpConnPool::Callbacks>(
-      *this, host, downstream_info_.downstreamAddressProvider().sslConnection()));
   combined_upstream_->recordUpstreamSslConnection();
 }
 
@@ -546,6 +553,17 @@ void CombinedUpstream::newStream(GenericConnectionPoolCallbacks&) {
   upstream_request_->acceptHeadersFromRouter(false);
 }
 
+void CombinedUpstream::deleteIsPending() {
+  if (delete_is_pending_) {
+    return;
+  }
+  onDownstreamEvent(Network::ConnectionEvent::LocalClose);
+  delete_is_pending_ = true;
+  if (upstream_request_) {
+    upstream_request_->cleanUp();
+  }
+}
+
 void CombinedUpstream::encodeData(Buffer::Instance& data, bool end_stream) {
   if (!upstream_request_) {
     return;
@@ -566,7 +584,7 @@ bool CombinedUpstream::readDisable(bool disable) {
 
 Tcp::ConnectionPool::ConnectionData*
 CombinedUpstream::onDownstreamEvent(Network::ConnectionEvent event, absl::string_view /*details*/) {
-  if (!upstream_request_) {
+  if (!upstream_request_ || delete_is_pending_) {
     return nullptr;
   }
 
@@ -606,7 +624,8 @@ void CombinedUpstream::onResetEncoder(Network::ConnectionEvent event, bool infor
   // If we did not receive a valid CONNECT response yet we treat this as a pool
   // failure, otherwise we forward the event downstream.
   if (conn_pool_callbacks_ != nullptr) {
-    conn_pool_callbacks_->onFailure();
+    auto callbacks = std::move(conn_pool_callbacks_);
+    callbacks->onFailure();
     return;
   }
 

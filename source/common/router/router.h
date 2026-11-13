@@ -732,6 +732,7 @@ private:
   // chunk.
   bool reject_early_connect_data_enabled_ : 1 = false;
   bool saw_local_reply_ : 1 = false;
+  bool destroyed_ : 1 = false;
 };
 
 class ProdFilter : public Filter {
