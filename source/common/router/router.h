@@ -744,6 +744,7 @@ private:
   // dropped. See dropKeptBody().
   bool drop_kept_body_ : 1 = false;
   bool saw_local_reply_ : 1 = false;
+  bool destroyed_ : 1 = false;
 };
 
 class ProdFilter : public Filter {

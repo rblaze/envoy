@@ -99,6 +99,7 @@ public:
 
   // GenericConnPool
   void newStream(GenericConnectionPoolCallbacks& callbacks) override;
+  void deleteIsPending() override;
 
   // Http::ConnectionPool::Callbacks,
   void onPoolFailure(ConnectionPool::PoolFailureReason reason,
@@ -321,6 +322,7 @@ public:
   using UpstreamRequestPtr = std::unique_ptr<UpstreamRequest>;
   void setRouterUpstreamRequest(UpstreamRequestPtr);
   void newStream(GenericConnectionPoolCallbacks& callbacks);
+  void deleteIsPending() override;
   void encodeData(Buffer::Instance& data, bool end_stream) override;
   Tcp::ConnectionPool::ConnectionData* onDownstreamEvent(Network::ConnectionEvent event,
                                                          absl::string_view details = "") override;
@@ -397,6 +399,7 @@ private:
       parent_.config_.propagateResponseHeaders(std::move(headers),
                                                parent_.downstream_info_.filterState());
       if (!is_valid_response || end_stream) {
+        tunnel_failed_ = true;
         parent_.tunnel_response_status_ = response_code;
         if (parent_.conn_pool_callbacks_ != nullptr) {
           parent_.conn_pool_callbacks_->cacheTunnelResponseStatus(response_code);
@@ -412,12 +415,18 @@ private:
       }
     }
     void decodeData(Buffer::Instance& data, bool end_stream) override {
+      if (tunnel_failed_) {
+        return;
+      }
       parent_.upstream_callbacks_.onUpstreamData(data, end_stream);
       if (end_stream) {
         parent_.doneReading();
       }
     }
     void decodeTrailers(Http::ResponseTrailerMapPtr&& trailers) override {
+      if (tunnel_failed_) {
+        return;
+      }
       parent_.config_.propagateResponseTrailers(std::move(trailers),
                                                 parent_.downstream_info_.filterState());
       Buffer::OwnedImpl data;
@@ -431,12 +440,14 @@ private:
 
   private:
     CombinedUpstream& parent_;
+    bool tunnel_failed_{false};
   };
   DecoderShim response_decoder_;
   Tcp::ConnectionPool::UpstreamCallbacks& upstream_callbacks_;
   std::unique_ptr<HttpConnPool::Callbacks> conn_pool_callbacks_;
   bool read_half_closed_{};
   bool write_half_closed_{};
+  bool delete_is_pending_{false};
   uint64_t tunnel_response_status_{0};
   // upstream_request_ has to be destroyed first as they may use CombinedUpstream parent
   // during destruction.
