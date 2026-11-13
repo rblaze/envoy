@@ -10,6 +10,7 @@
 
 #include "test/integration/filters/add_header_filter.pb.h"
 #include "test/integration/filters/stop_and_continue_filter_config.pb.h"
+#include "test/integration/filters/test_filters.pb.h"
 #include "test/integration/http_integration.h"
 #include "test/integration/http_protocol_integration.h"
 #include "test/integration/tcp_tunneling_integration.h"
@@ -1190,6 +1191,90 @@ TEST_P(TcpTunnelingIntegrationTest, UpstreamHttpFiltersPauseAndResume) {
   } else {
     ASSERT_TRUE(upstream_request_->waitForEndStream(*dispatcher_));
   }
+}
+
+TEST_P(TcpTunnelingIntegrationTest, UpstreamHttpFiltersLocalReply) {
+  if (!(GetParam().tunneling_with_upstream_filters)) {
+    return;
+  }
+  enableHalfClose(false);
+  config_helper_.addConfigModifier([&](envoy::config::bootstrap::v3::Bootstrap& bootstrap) -> void {
+    for (auto& listener : *bootstrap.mutable_static_resources()->mutable_listeners()) {
+      if (listener.name() != "tcp_proxy") {
+        continue;
+      }
+      auto* filter = listener.mutable_filter_chains(0)->mutable_filters(0);
+      auto proxy_config =
+          MessageUtil::anyConvert<envoy::extensions::filters::network::tcp_proxy::v3::TcpProxy>(
+              filter->typed_config());
+      proxy_config.mutable_max_connect_attempts()->set_value(2);
+      std::ignore = filter->mutable_typed_config()->PackFrom(proxy_config);
+    }
+  });
+  HttpFilterProto filter_config;
+  filter_config.set_name("local-reply-during-host-selection");
+  std::ignore = filter_config.mutable_typed_config()->PackFrom(
+      test::integration::filters::LocalReplyDuringHostSelectionConfig());
+  addHttpUpstreamFilterToCluster(filter_config);
+  addHttpUpstreamFilterToCluster(getCodecFilterConfig());
+  initialize();
+
+  tcp_client_ = makeTcpConnection(lookupPort("tcp_proxy"));
+  tcp_client_->waitForDisconnect();
+  EXPECT_EQ("", tcp_client_->data());
+}
+
+TEST_P(TcpTunnelingIntegrationTest, UpstreamHttpFiltersPreTunnelContinueAndResetStream) {
+  if (!(GetParam().tunneling_with_upstream_filters)) {
+    return;
+  }
+  enableHalfClose(false);
+  config_helper_.addConfigModifier([&](envoy::config::bootstrap::v3::Bootstrap& bootstrap) -> void {
+    for (auto& listener : *bootstrap.mutable_static_resources()->mutable_listeners()) {
+      if (listener.name() != "tcp_proxy") {
+        continue;
+      }
+      auto* filter = listener.mutable_filter_chains(0)->mutable_filters(0);
+      auto proxy_config =
+          MessageUtil::anyConvert<envoy::extensions::filters::network::tcp_proxy::v3::TcpProxy>(
+              filter->typed_config());
+      auto* header =
+          proxy_config.mutable_tunneling_config()->add_headers_to_add()->mutable_header();
+      header->set_key("reset");
+      header->set_value("yes");
+      std::ignore = filter->mutable_typed_config()->PackFrom(proxy_config);
+    }
+  });
+  HttpFilterProto filter_config;
+  filter_config.set_name("on-local-reply-filter");
+  std::ignore = filter_config.mutable_typed_config()->PackFrom(
+      test::integration::filters::OnLocalReplyFilterConfig());
+  addHttpUpstreamFilterToCluster(filter_config);
+  addHttpUpstreamFilterToCluster(getCodecFilterConfig());
+  initialize();
+
+  tcp_client_ = makeTcpConnection(lookupPort("tcp_proxy"));
+  tcp_client_->waitForDisconnect();
+  EXPECT_EQ("", tcp_client_->data());
+}
+
+TEST_P(TcpTunnelingIntegrationTest, UpstreamHttpFiltersPostTunnelLocalReplyResetsStream) {
+  if (!(GetParam().tunneling_with_upstream_filters)) {
+    return;
+  }
+  enableHalfClose(false);
+  HttpFilterProto filter_config;
+  filter_config.set_name("local-reply-during-encode-data");
+  std::ignore = filter_config.mutable_typed_config()->PackFrom(
+      test::integration::filters::LocalReplyDuringEncodeDataConfig());
+  addHttpUpstreamFilterToCluster(filter_config);
+  addHttpUpstreamFilterToCluster(getCodecFilterConfig());
+  initialize();
+
+  setUpConnection(fake_upstream_connection_);
+  upstream_request_->encodeData("payload", false);
+  tcp_client_->waitForDisconnect();
+  EXPECT_EQ("", tcp_client_->data());
 }
 
 TEST_P(TcpTunnelingIntegrationTest, SchemeHeader) {

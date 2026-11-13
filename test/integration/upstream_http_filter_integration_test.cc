@@ -1009,5 +1009,47 @@ INSTANTIATE_TEST_SUITE_P(IpVersionsClientType, DynamicRouterAndClusterFiltersInt
                          GRPC_CLIENT_INTEGRATION_PARAMS,
                          GrpcClientIntegrationParamTestParams::protocolTestParamsToString);
 
+// Retrying a POST request with both buffered body and trailers must not crash in continueDoRetry()
+// when an upstream HTTP filter sends a local reply in decodeData() on the retry attempt.
+TEST_P(StaticRouterOrClusterFiltersIntegrationTest, DecodeDataLocalReplyRetryWithTrailers) {
+  autonomous_allow_incomplete_streams_ = true;
+  config_helper_.addConfigModifier(
+      [](envoy::extensions::filters::network::http_connection_manager::v3::HttpConnectionManager&
+             hcm) {
+        auto* retry_policy = hcm.mutable_route_config()
+                                 ->mutable_virtual_hosts(0)
+                                 ->mutable_routes(0)
+                                 ->mutable_route()
+                                 ->mutable_retry_policy();
+        retry_policy->set_retry_on("5xx");
+        retry_policy->mutable_num_retries()->set_value(1);
+        retry_policy->mutable_retry_back_off()->mutable_base_interval()->set_nanos(100 * 1000 *
+                                                                                   1000);
+      });
+
+  addStaticTypedConfigFilter("local-reply-during-decode",
+                             test::integration::filters::LocalReplyDuringDecodeConfig());
+  addCodecFilter();
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  Http::TestRequestHeaderMapImpl post_headers{{":method", "POST"},
+                                              {":path", "/"},
+                                              {":scheme", "https"},
+                                              {":authority", "host"},
+                                              {"local-reply-during-data", "true"}};
+  auto encoder_decoder = codec_client_->startRequest(post_headers);
+  request_encoder_ = &encoder_decoder.first;
+  auto response = std::move(encoder_decoder.second);
+  codec_client_->sendData(*request_encoder_, "request body", false);
+  Http::TestRequestTrailerMapImpl request_trailers{{"x-req-trailer", "val"}};
+  codec_client_->sendTrailers(*request_encoder_, request_trailers);
+
+  ASSERT_TRUE(response->waitForEndStream());
+  EXPECT_TRUE(response->complete());
+  EXPECT_EQ("500", response->headers().getStatusValue());
+  cleanupUpstreamAndDownstream();
+}
+
 } // namespace
 } // namespace Envoy

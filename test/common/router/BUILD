@@ -574,9 +574,12 @@ envoy_cc_test(
     rbe_pool = {"build": "linux_x64_small"},
     deps = [
         "//source/common/buffer:buffer_lib",
+        "//source/common/common:base64_lib",
         "//source/common/http:filter_chain_helper_lib",
         "//source/common/network:utility_lib",
+        "//source/common/router:config_lib",
         "//source/common/router:router_lib",
+        "//source/common/router:upstream_codec_filter_lib",
         "//source/common/upstream:upstream_includes",
         "//source/common/upstream:upstream_lib",
         "//source/extensions/access_loggers/file:config",

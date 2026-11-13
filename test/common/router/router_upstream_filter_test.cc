@@ -3,6 +3,7 @@
 #include "envoy/extensions/filters/http/upstream_codec/v3/upstream_codec.pb.h"
 #include "envoy/extensions/filters/network/http_connection_manager/v3/http_connection_manager.pb.h"
 
+#include "source/common/common/base64.h"
 #include "source/common/router/config_impl.h"
 #include "source/common/router/router.h"
 #include "source/common/router/upstream_codec_filter.h"
@@ -15,6 +16,7 @@
 #include "test/mocks/network/mocks.h"
 #include "test/mocks/router/mocks.h"
 #include "test/mocks/server/factory_context.h"
+#include "test/mocks/server/server_factory_context.h"
 #include "test/test_common/registry.h"
 #include "test/test_common/test_runtime.h"
 #include "test/test_common/utility.h"
@@ -116,7 +118,14 @@ public:
 class UpstreamLocalReplyDecoderFilter : public Http::PassThroughDecoderFilter,
                                         public Http::UpstreamCallbacks {
 public:
-  enum class TriggerPhase { None, OnHostSelected, DecodeHeaders, DecodeData, DecodeTrailers };
+  enum class TriggerPhase {
+    None,
+    OnHostSelected,
+    OnUpstreamConnectionEstablished,
+    DecodeHeaders,
+    DecodeData,
+    DecodeTrailers
+  };
 
   explicit UpstreamLocalReplyDecoderFilter(TriggerPhase phase,
                                            Http::Code code = Http::Code::ServiceUnavailable,
@@ -126,6 +135,7 @@ public:
 
   // Http::StreamDecoderFilter
   Http::FilterHeadersStatus decodeHeaders(Http::RequestHeaderMap&, bool) override {
+    ++decode_headers_called_;
     if (phase_ == TriggerPhase::DecodeHeaders) {
       sendLocalReply();
       return Http::FilterHeadersStatus::StopIteration;
@@ -167,16 +177,30 @@ public:
       destroyed_during_on_host_selected_ = destroyed_;
     }
   }
-  void onUpstreamConnectionEstablished() override {}
+  void onUpstreamConnectionEstablished() override {
+    ++on_upstream_connection_established_called_;
+    if (destroyed_) {
+      called_after_destroy_ = true;
+    }
+    if (phase_ == TriggerPhase::OnUpstreamConnectionEstablished) {
+      sendLocalReply();
+      destroyed_during_on_upstream_connection_established_ = destroyed_;
+    }
+  }
 
   // Applied to the local reply headers, if set.
   std::function<void(Http::ResponseHeaderMap&)> modify_headers_;
   // If true, onLocalReply() asks for the stream to be reset instead of sending the local reply.
   bool reset_on_local_reply_{false};
   int on_local_reply_called_{0};
+  int decode_headers_called_{0};
+  int on_upstream_connection_established_called_{0};
   bool destroyed_{false};
+  bool called_after_destroy_{false};
   // Whether the filter was destroyed by the time sendLocalReply() returned in onHostSelected().
   bool destroyed_during_on_host_selected_{false};
+  // Whether the filter was destroyed before onUpstreamConnectionEstablished() returned.
+  bool destroyed_during_on_upstream_connection_established_{false};
 
 private:
   void sendLocalReply() {
@@ -1426,6 +1450,370 @@ TEST_F(RouterUpstreamFilterTest, NonRetriableLocalReplyWhileHedgedRequestInFligh
       Http::ResponseHeaderMapPtr{new Http::TestResponseHeaderMapImpl{{":status", "200"}}}, true);
   EXPECT_EQ(StreamInfo::ResponseCodeDetails::get().ViaUpstream, callbacks_.details());
   EXPECT_EQ(0U, connPool().host_->stats_.rq_error_.value());
+}
+
+// Retrying a request with both buffered body and trailers must not dereference an empty
+// upstream_requests_ list when an upstream filter sends a local reply in decodeData() on the retry
+// attempt.
+TEST_F(RouterUpstreamFilterTest, RetryWithBodyAndTrailersLocalReplyInDecodeData) {
+  Buffer::OwnedImpl decoding_buffer;
+  EXPECT_CALL(callbacks_, decodingBuffer()).WillRepeatedly(Return(&decoding_buffer));
+  EXPECT_CALL(callbacks_, addDecodedData(_, true))
+      .WillRepeatedly([&](Buffer::Instance& data, bool) { decoding_buffer.move(data); });
+
+  auto decoder_filter_1 = std::make_shared<UpstreamLocalReplyDecoderFilter>(
+      UpstreamLocalReplyDecoderFilter::TriggerPhase::DecodeTrailers, Http::Code::ServiceUnavailable,
+      "attempt 1 reply", "attempt_1_details");
+  auto decoder_filter_2 = std::make_shared<UpstreamLocalReplyDecoderFilter>(
+      UpstreamLocalReplyDecoderFilter::TriggerPhase::DecodeData, Http::Code::ServiceUnavailable,
+      "attempt 2 reply", "attempt_2_details");
+
+  initWithCodecFilter();
+  router_->preallocateRetryState();
+  EXPECT_CALL(*cluster_info_, createFilterChain(_))
+      .WillOnce(addFilters(nullptr, decoder_filter_1))
+      .WillOnce(addFilters(nullptr, decoder_filter_2));
+
+  NiceMock<Envoy::ConnectionPool::MockCancellable> cancellable_1;
+  NiceMock<Envoy::ConnectionPool::MockCancellable> cancellable_2;
+  EXPECT_CALL(connPool(), newStream(_, _, _))
+      .WillOnce(Return(&cancellable_1))
+      .WillOnce(Return(&cancellable_2));
+  EXPECT_CALL(cancellable_1, cancel(_));
+  EXPECT_CALL(cancellable_2, cancel(_));
+
+  Http::TestRequestHeaderMapImpl headers;
+  HttpTestUtility::addDefaultHeaders(headers);
+  router_->decodeHeaders(headers, false);
+
+  Buffer::OwnedImpl body("request body");
+  router_->decodeData(body, false);
+
+  router_->retry_state_->expectHeadersRetry();
+  Http::TestRequestTrailerMapImpl trailers{{"x-trailer", "value"}};
+  router_->decodeTrailers(trailers);
+
+  EXPECT_CALL(*router_->retry_state_, shouldRetryHeaders(_, _, _))
+      .WillOnce(Return(RetryStatus::NoRetryLimitExceeded));
+  EXPECT_CALL(callbacks_, encodeHeaders_(_, false))
+      .WillOnce(Invoke([](Http::ResponseHeaderMap& resp_headers, bool) {
+        EXPECT_EQ("503", resp_headers.getStatusValue());
+      }));
+  EXPECT_CALL(callbacks_, encodeData(_, true));
+
+  router_->retry_state_->callback_();
+}
+
+// A local reply sent inside onUpstreamConnectionEstablished() must be deferred until the callback
+// returns (not destroying filters reentrantly while onUpstreamConnectionEstablished() is on the
+// stack) and must stop notifying subsequent filters' onUpstreamConnectionEstablished().
+TEST_F(RouterUpstreamFilterTest, OnUpstreamConnectionEstablishedLocalReplyDefersAndStopsCallbacks) {
+  auto filter_1 = std::make_shared<UpstreamLocalReplyDecoderFilter>(
+      UpstreamLocalReplyDecoderFilter::TriggerPhase::OnUpstreamConnectionEstablished,
+      Http::Code::Forbidden, "connection rejected", "on_connection_established_rejected");
+  auto filter_2 = std::make_shared<UpstreamLocalReplyDecoderFilter>(
+      UpstreamLocalReplyDecoderFilter::TriggerPhase::None);
+
+  initWithCodecFilter();
+  EXPECT_CALL(*cluster_info_, createFilterChain(_))
+      .WillOnce(Invoke([&](Http::FilterChainFactoryCallbacks& callbacks) -> bool {
+        callbacks.addStreamDecoderFilter(filter_1);
+        callbacks.addStreamDecoderFilter(filter_2);
+        return false;
+      }));
+
+  Http::ConnectionPool::Callbacks* pool_callbacks = nullptr;
+  EXPECT_CALL(connPool(), newStream(_, _, _))
+      .WillOnce(Invoke([&](Http::ResponseDecoder&, Http::ConnectionPool::Callbacks& callbacks,
+                           const Http::ConnectionPool::Instance::StreamOptions&)
+                           -> Http::ConnectionPool::Cancellable* {
+        pool_callbacks = &callbacks;
+        return nullptr;
+      }));
+
+  Http::TestRequestHeaderMapImpl headers;
+  HttpTestUtility::addDefaultHeaders(headers);
+  router_->decodeHeaders(headers, true);
+  ASSERT_NE(nullptr, pool_callbacks);
+
+  NiceMock<Http::MockRequestEncoder> encoder;
+  EXPECT_CALL(encoder.stream_, connectionInfoProvider())
+      .WillRepeatedly(ReturnRef(connection_info1_));
+  EXPECT_CALL(encoder.stream_, resetStream(_));
+  EXPECT_CALL(encoder, encodeHeaders(_, _)).Times(0);
+  EXPECT_CALL(callbacks_, encodeHeaders_(_, false))
+      .WillOnce(Invoke([](Http::ResponseHeaderMap& resp_headers, bool) {
+        EXPECT_EQ("403", resp_headers.getStatusValue());
+      }));
+  EXPECT_CALL(callbacks_, encodeData(_, true));
+
+  pool_callbacks->onPoolReady(encoder, connPool().host_, stream_info_, Http::Protocol::Http11);
+
+  EXPECT_FALSE(filter_1->destroyed_during_on_upstream_connection_established_);
+  EXPECT_TRUE(filter_1->destroyed_);
+  EXPECT_EQ(0, filter_2->on_upstream_connection_established_called_);
+  EXPECT_FALSE(filter_2->called_after_destroy_);
+}
+
+// When an upstream filter local reply on attempt 1 is retried and attempt 2 succeeds from upstream,
+// attempt 1's LocalReplyOwner filter state must not leak onto the downstream StreamInfo.
+TEST_F(RouterUpstreamFilterTest, LocalReplyOwnerDoesNotLeakToDownstreamOnSuccessfulRetry) {
+  auto decoder_filter_1 = std::make_shared<UpstreamLocalReplyDecoderFilter>(
+      UpstreamLocalReplyDecoderFilter::TriggerPhase::DecodeHeaders, Http::Code::ServiceUnavailable,
+      "attempt 1 local reply", "attempt_1_details");
+
+  initWithCodecFilter();
+  router_->preallocateRetryState();
+  EXPECT_CALL(*cluster_info_, createFilterChain(_))
+      .WillOnce(Invoke([&](Http::FilterChainFactoryCallbacks& callbacks) -> bool {
+        callbacks.setFilterConfigName("attempt_1_upstream_filter");
+        callbacks.addStreamDecoderFilter(decoder_filter_1);
+        return false;
+      }))
+      .WillOnce(addFilters(nullptr, nullptr));
+
+  NiceMock<Envoy::ConnectionPool::MockCancellable> cancellable_1;
+  Http::ResponseDecoder* response_decoder_2 = nullptr;
+  NiceMock<Http::MockRequestEncoder> encoder_2;
+  EXPECT_CALL(connPool(), newStream(_, _, _))
+      .WillOnce(Return(&cancellable_1))
+      .WillOnce(poolReadyWith(encoder_2, &response_decoder_2));
+  EXPECT_CALL(cancellable_1, cancel(_));
+
+  router_->retry_state_->expectHeadersRetry();
+  Http::TestRequestHeaderMapImpl headers;
+  HttpTestUtility::addDefaultHeaders(headers);
+  router_->decodeHeaders(headers, true);
+
+  router_->retry_state_->callback_();
+  ASSERT_NE(nullptr, response_decoder_2);
+
+  EXPECT_CALL(*router_->retry_state_, shouldRetryHeaders(_, _, _))
+      .WillOnce(Return(RetryStatus::No));
+  EXPECT_CALL(callbacks_, encodeHeaders_(_, true))
+      .WillOnce(Invoke([](Http::ResponseHeaderMap& resp_headers, bool) {
+        EXPECT_EQ("200", resp_headers.getStatusValue());
+      }));
+
+  response_decoder_2->decodeHeaders(
+      Http::ResponseHeaderMapPtr{new Http::TestResponseHeaderMapImpl{{":status", "200"}}}, true);
+
+  EXPECT_FALSE(callbacks_.stream_info_.filterState()->hasIndexedData(
+      StreamInfo::FilterStateIndex::LocalReplyOwner));
+}
+
+// Once a non-retried upstream filter local reply in decodeHeaders(end_stream=false) has completed
+// the downstream response, subsequent request body chunks must be dropped cleanly even when
+// internal redirects are enabled and the body exceeds the request buffer limit.
+TEST_F(RouterUpstreamFilterTest,
+       CompletedLocalReplyInDecodeHeadersDropsDataExceedingRedirectBufferLimit) {
+  ON_CALL(callbacks_.route_->route_entry_.internal_redirect_policy_, enabled())
+      .WillByDefault(Return(true));
+  ON_CALL(callbacks_, bufferLimit()).WillByDefault(Return(10));
+
+  auto decoder_filter = std::make_shared<UpstreamLocalReplyDecoderFilter>(
+      UpstreamLocalReplyDecoderFilter::TriggerPhase::DecodeHeaders, Http::Code::BadRequest,
+      "rejected headers", "decode_headers_local_reply");
+
+  initWithCodecFilter();
+  EXPECT_CALL(*cluster_info_, createFilterChain(_)).WillOnce(addFilters(nullptr, decoder_filter));
+  NiceMock<Envoy::ConnectionPool::MockCancellable> cancellable;
+  EXPECT_CALL(connPool(), newStream(_, _, _)).WillOnce(Return(&cancellable));
+  EXPECT_CALL(cancellable, cancel(_));
+
+  EXPECT_CALL(callbacks_, encodeHeaders_(_, false));
+  EXPECT_CALL(callbacks_, encodeData(_, true));
+  EXPECT_CALL(callbacks_, sendLocalReply(_, _, _, _, _)).Times(0);
+
+  Http::TestRequestHeaderMapImpl headers;
+  HttpTestUtility::addDefaultHeaders(headers);
+  router_->decodeHeaders(headers, false);
+
+  Buffer::OwnedImpl large_body(std::string(20, 'x'));
+  router_->decodeData(large_body, true);
+}
+
+// Trailers added by an upstream encoder filter to an upstream filter local reply did not come from
+// the upstream host and must not be processed as host ORCA load reports.
+TEST_F(RouterUpstreamFilterTest, LocalReplyTrailersDoNotProcessOrcaLoadReport) {
+  class OrcaTrailerAddingEncoderFilter : public Http::PassThroughEncoderFilter {
+  public:
+    explicit OrcaTrailerAddingEncoderFilter(std::string orca_bin)
+        : orca_bin_(std::move(orca_bin)) {}
+    Http::FilterDataStatus encodeData(Buffer::Instance&, bool end_stream) override {
+      if (end_stream) {
+        auto& trailers = encoder_callbacks_->addEncodedTrailers();
+        trailers.addCopy(Http::LowerCaseString("endpoint-load-metrics-bin"), orca_bin_);
+      }
+      return Http::FilterDataStatus::Continue;
+    }
+
+  private:
+    std::string orca_bin_;
+  };
+
+  xds::data::orca::v3::OrcaLoadReport orca_load_report;
+  orca_load_report.set_cpu_utilization(0.75);
+  const std::string proto_string =
+      TestUtility::getProtobufBinaryStringFromMessage(orca_load_report);
+  const std::string orca_bin = Envoy::Base64::encode(proto_string.c_str(), proto_string.length());
+
+  auto encoder_filter = std::make_shared<OrcaTrailerAddingEncoderFilter>(orca_bin);
+  auto decoder_filter = std::make_shared<UpstreamLocalReplyDecoderFilter>(
+      UpstreamLocalReplyDecoderFilter::TriggerPhase::DecodeHeaders, Http::Code::ServiceUnavailable,
+      "unavailable", "local_reply_with_trailers");
+
+  initWithCodecFilter();
+  Envoy::Orca::LrsReportMetricNames metric_names{"cpu_utilization"};
+  ON_CALL(*cluster_info_, lrsReportMetricNames())
+      .WillByDefault(Return(makeOptRef<const Envoy::Orca::LrsReportMetricNames>(metric_names)));
+
+  EXPECT_CALL(*cluster_info_, createFilterChain(_))
+      .WillOnce(addFilters(encoder_filter, decoder_filter));
+  NiceMock<Envoy::ConnectionPool::MockCancellable> cancellable;
+  EXPECT_CALL(connPool(), newStream(_, _, _)).WillOnce(Return(&cancellable));
+  EXPECT_CALL(cancellable, cancel(_));
+
+  EXPECT_CALL(callbacks_, encodeHeaders_(_, false));
+  EXPECT_CALL(callbacks_, encodeData(_, false));
+  EXPECT_CALL(callbacks_, encodeTrailers_(_));
+
+  Http::TestRequestHeaderMapImpl headers;
+  HttpTestUtility::addDefaultHeaders(headers);
+  router_->decodeHeaders(headers, true);
+
+  EXPECT_EQ(nullptr, connPool().host_->loadMetricStats().latch());
+}
+
+// If an upstream filter sends a local reply in onHostSelected() (before any upstream stream is
+// created) and an upstream encoder filter pauses that local reply until the global response timeout
+// fires, the host must not be charged with a timeout stat or outlier detection timeout.
+TEST_F(RouterUpstreamFilterTest, PausedOnHostSelectedLocalReplyTimeoutDoesNotPenalizeHost) {
+  class PausingEncoderFilter : public Http::PassThroughEncoderFilter {
+  public:
+    Http::FilterHeadersStatus encodeHeaders(Http::ResponseHeaderMap&, bool) override {
+      return Http::FilterHeadersStatus::StopIteration;
+    }
+    Http::FilterDataStatus encodeData(Buffer::Instance&, bool) override {
+      return Http::FilterDataStatus::StopIterationAndBuffer;
+    }
+  };
+
+  auto encoder_filter = std::make_shared<PausingEncoderFilter>();
+  auto decoder_filter = std::make_shared<UpstreamLocalReplyDecoderFilter>(
+      UpstreamLocalReplyDecoderFilter::TriggerPhase::OnHostSelected, Http::Code::Forbidden,
+      "host rejected", "on_host_selected_paused");
+
+  initWithCodecFilter();
+  EXPECT_CALL(*cluster_info_, createFilterChain(_))
+      .WillOnce(addFilters(encoder_filter, decoder_filter));
+  EXPECT_CALL(connPool(), newStream(_, _, _)).Times(0);
+  EXPECT_CALL(connPool().host_->outlier_detector_, putResult(_, _)).Times(0);
+
+  Event::MockTimer* response_timeout = new NiceMock<Event::MockTimer>(&callbacks_.dispatcher_);
+  Http::TestRequestHeaderMapImpl headers;
+  HttpTestUtility::addDefaultHeaders(headers);
+  router_->decodeHeaders(headers, true);
+
+  EXPECT_CALL(callbacks_, sendLocalReply(Http::Code::GatewayTimeout, _, _, _,
+                                         StreamInfo::ResponseCodeDetails::get().ResponseTimeout));
+  response_timeout->invokeCallback();
+
+  EXPECT_EQ(0U, connPool().host_->stats_.rq_timeout_.value());
+  router_->onDestroy();
+}
+
+// When an upstream filter returns ContinueAndResetStream from onLocalReply() during
+// decodeHeaders(end_stream=false) and downstream resetStream() synchronously runs
+// Router::Filter::onDestroy(), continueDecodeHeaders() must return immediately instead of starting
+// shadow streams after onDestroy().
+TEST_F(RouterUpstreamFilterTest, ContinueAndResetStreamInDecodeHeadersDestroyingRouterSkipsShadow) {
+  auto decoder_filter = std::make_shared<UpstreamLocalReplyDecoderFilter>(
+      UpstreamLocalReplyDecoderFilter::TriggerPhase::DecodeHeaders, Http::Code::ServiceUnavailable,
+      "unavailable", "upstream_filter_reset_details");
+  decoder_filter->reset_on_local_reply_ = true;
+
+  initWithCodecFilter();
+  addShadowPolicy();
+  EXPECT_CALL(*cluster_info_, createFilterChain(_)).WillOnce(addFilters(nullptr, decoder_filter));
+  NiceMock<Envoy::ConnectionPool::MockCancellable> cancellable;
+  EXPECT_CALL(connPool(), newStream(_, _, _)).WillOnce(Return(&cancellable));
+  EXPECT_CALL(cancellable, cancel(_));
+
+  EXPECT_CALL(*shadow_writer_, streamingShadow_(_, _, _)).Times(0);
+  EXPECT_CALL(callbacks_, resetStream(_, _))
+      .WillOnce(
+          Invoke([this](Http::StreamResetReason, absl::string_view) { router_->onDestroy(); }));
+
+  Http::TestRequestHeaderMapImpl headers;
+  HttpTestUtility::addDefaultHeaders(headers);
+  EXPECT_EQ(Http::FilterHeadersStatus::StopIteration, router_->decodeHeaders(headers, false));
+}
+
+// UpstreamCodecFilter::decodeHeaders() protocol errors must stay isolated on the per-attempt
+// upstream StreamInfo when retried (so a succeeding retry does not carry DownstreamProtocolError),
+// and be copied to the downstream StreamInfo when forwarded without retry.
+TEST_F(RouterUpstreamFilterTest,
+       UpstreamCodecFilterProtocolErrorIsolatedOnRetryAndCopiedWhenForwarded) {
+  initWithCodecFilter();
+  router_->preallocateRetryState();
+  router_->retry_state_->expectHeadersRetry();
+  EXPECT_CALL(*cluster_info_, createFilterChain(_))
+      .WillOnce(addFilters(nullptr, nullptr))
+      .WillOnce(addFilters(nullptr, nullptr));
+
+  NiceMock<Http::MockRequestEncoder> encoder_1;
+  NiceMock<Http::MockRequestEncoder> encoder_2;
+  EXPECT_CALL(connPool(), newStream(_, _, _))
+      .WillOnce(poolReadyWith(encoder_1))
+      .WillOnce(poolReadyWith(encoder_2));
+  EXPECT_CALL(encoder_1, encodeHeaders(_, true))
+      .WillOnce(Return(Http::codecClientError("missing required header")));
+  EXPECT_CALL(encoder_2, encodeHeaders(_, true))
+      .WillOnce(Return(Http::codecClientError("missing required header again")));
+
+  Http::TestRequestHeaderMapImpl headers;
+  HttpTestUtility::addDefaultHeaders(headers);
+  router_->decodeHeaders(headers, true);
+
+  EXPECT_FALSE(callbacks_.streamInfo().hasResponseFlag(
+      StreamInfo::CoreResponseFlag::DownstreamProtocolError));
+
+  EXPECT_CALL(*router_->retry_state_, shouldRetryHeaders(_, _, _))
+      .WillOnce(Return(RetryStatus::No));
+  EXPECT_CALL(callbacks_, encodeHeaders_(_, false));
+  EXPECT_CALL(callbacks_, encodeData(_, true));
+  router_->retry_state_->callback_();
+
+  EXPECT_TRUE(callbacks_.streamInfo().hasResponseFlag(
+      StreamInfo::CoreResponseFlag::DownstreamProtocolError));
+}
+
+// An upstream filter local reply never reached the upstream host and must not record the per-try
+// timeout budget histogram in UpstreamRequest::cleanUp().
+TEST_F(RouterUpstreamFilterTest, LocalReplySkipsPerTryTimeoutBudgetHistogram) {
+  auto decoder_filter = std::make_shared<UpstreamLocalReplyDecoderFilter>(
+      UpstreamLocalReplyDecoderFilter::TriggerPhase::DecodeHeaders, Http::Code::ServiceUnavailable,
+      "unavailable", "local_reply_timeout_budget");
+
+  initWithCodecFilter();
+  EXPECT_CALL(*cluster_info_, createFilterChain(_)).WillOnce(addFilters(nullptr, decoder_filter));
+  NiceMock<Envoy::ConnectionPool::MockCancellable> cancellable;
+  EXPECT_CALL(connPool(), newStream(_, _, _)).WillOnce(Return(&cancellable));
+  EXPECT_CALL(cancellable, cancel(_));
+
+  EXPECT_CALL(
+      cluster_info_->timeout_budget_stats_store_,
+      deliverHistogramToSinks(testing::Property(&Stats::Metric::name,
+                                                "upstream_rq_timeout_budget_per_try_percent_used"),
+                              _))
+      .Times(0);
+  EXPECT_CALL(callbacks_, encodeHeaders_(_, false));
+  EXPECT_CALL(callbacks_, encodeData(_, true));
+
+  Http::TestRequestHeaderMapImpl headers;
+  HttpTestUtility::addDefaultHeaders(headers);
+  router_->decodeHeaders(headers, true);
 }
 
 } // namespace
