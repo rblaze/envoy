@@ -992,6 +992,7 @@ protected:
     // True when the filter chain iteration was aborted with local reply.
     bool decoder_filter_chain_aborted_{};
     bool encoder_filter_chain_aborted_{};
+    bool local_reply_aborted_{};
     bool saw_downstream_reset_{};
     // True when the stream was recreated.
     bool recreated_stream_{};
@@ -1023,30 +1024,30 @@ protected:
    * Flags that keep track of which filter calls are currently in progress.
    */
   // clang-format off
-    struct FilterCallState {
-      static constexpr uint32_t DecodeHeaders   = 0x01;
-      static constexpr uint32_t DecodeData      = 0x02;
-      static constexpr uint32_t DecodeMetadata  = 0x04;
-      static constexpr uint32_t DecodeTrailers  = 0x08;
-      static constexpr uint32_t EncodeHeaders   = 0x10;
-      static constexpr uint32_t EncodeData      = 0x20;
-      static constexpr uint32_t EncodeMetadata  = 0x40;
-      static constexpr uint32_t EncodeTrailers  = 0x80;
-      // Encode1xxHeaders is a bit of a special state as 1xx
-      // headers may be sent during request processing. This state is only used
-      // to verify we do not encode1xx headers more than once per
-      // filter.
-      static constexpr uint32_t Encode1xxHeaders  = 0x100;
-      // Used to indicate that one of the following conditions is true:
-      // 1. The filter manager is processing the final [En|De]codeData frame.
-      // 2. The filter manager is in [En|De]codeHeaders and is processing a
-      //    header-only request or response.
-      static constexpr uint32_t EndOfStream = 0x200;
+  struct FilterCallState {
+    static constexpr uint32_t DecodeHeaders   = 0x01;
+    static constexpr uint32_t DecodeData      = 0x02;
+    static constexpr uint32_t DecodeMetadata  = 0x04;
+    static constexpr uint32_t DecodeTrailers  = 0x08;
+    static constexpr uint32_t EncodeHeaders   = 0x10;
+    static constexpr uint32_t EncodeData      = 0x20;
+    static constexpr uint32_t EncodeMetadata  = 0x40;
+    static constexpr uint32_t EncodeTrailers  = 0x80;
+    // Encode1xxHeaders is a bit of a special state as 1xx
+    // headers may be sent during request processing. This state is only used
+    // to verify we do not encode1xx headers more than once per
+    // filter.
+    static constexpr uint32_t Encode1xxHeaders  = 0x100;
+    // Used to indicate that one of the following conditions is true:
+    // 1. The filter manager is processing the final [En|De]codeData frame.
+    // 2. The filter manager is in [En|De]codeHeaders and is processing a
+    //    header-only request or response.
+    static constexpr uint32_t EndOfStream = 0x200;
 
-      // Masks for filter call state.
-      static constexpr uint32_t IsDecodingMask = DecodeHeaders | DecodeData | DecodeMetadata | DecodeTrailers;
-      static constexpr uint32_t IsEncodingMask = EncodeHeaders | Encode1xxHeaders | EncodeData | EncodeMetadata | EncodeTrailers;
-    };
+    // Masks for filter call state.
+    static constexpr uint32_t IsDecodingMask = DecodeHeaders | DecodeData | DecodeMetadata | DecodeTrailers;
+    static constexpr uint32_t IsEncodingMask = EncodeHeaders | Encode1xxHeaders | EncodeData | EncodeMetadata | EncodeTrailers;
+  };
   // clang-format on
 
   State& state() { return state_; }
@@ -1054,17 +1055,18 @@ protected:
   // Called by sendLocalReply() before the local reply is built, for example to create the filter
   // chain so that the local reply is access logged. The default implementation does nothing.
   virtual void onBeforeLocalReply() {}
+  // Returns the StreamInfo where local reply metadata (response code details and the
+  // LocalReplyOwner filter state) is recorded. The default implementation returns streamInfo().
+  virtual StreamInfo::StreamInfo& localReplyStreamInfo() { return streamInfo(); }
   // Records the response code details of a local reply. The default implementation sets them on
-  // streamInfo().
+  // localReplyStreamInfo().
   virtual void setLocalReplyResponseCodeDetails(absl::string_view details) {
-    streamInfo().setResponseCodeDetails(details);
+    localReplyStreamInfo().setResponseCodeDetails(details);
   }
   // Finalizes the headers of a local reply before they are encoded. Called before the
   // `modify_headers` callback passed to sendLocalReply(), if any, is applied. The default
   // implementation does nothing.
-  virtual void finalizeLocalReplyHeaders(ResponseHeaderMap& headers) {
-    UNREFERENCED_PARAMETER(headers);
-  }
+  virtual void finalizeLocalReplyHeaders(ResponseHeaderMap& /*headers*/) {}
   // Rewrites the local reply before it is encoded. The default implementation re-applies `:status`
   // from `code`, as the downstream rewriter also does, so that a `modify_headers` callback copying
   // a `:status` header cannot leave an invalid (for example, comma-joined) status behind. It does
@@ -1324,11 +1326,6 @@ public:
   }
 
   CreateChainResult createDownstreamFilterChain();
-
-  /**
-   * Whether downstream has observed end_stream.
-   */
-  bool decoderObservedEndStream() const override { return state_.observed_decode_end_stream_; }
 
   /**
    * Return true if the timestamp of the downstream end_stream was recorded.
