@@ -645,6 +645,73 @@ TEST_F(UpstreamRequestTest, CodecFilterWatermarksAfterUpstreamResetAreNoops) {
   upstream_request_.reset();
 }
 
+// When an upstream encoder filter triggers sendLocalReply() inside encodeHeaders(),
+// setResponseHeaders() must retain the superseded header map until UpstreamRequest teardown rather
+// than freeing it while encodeHeaders() still holds a reference on the stack.
+TEST_F(UpstreamRequestTest, EncoderFilterLocalReplyDuringEncodeHeadersKeepsOriginalHeadersAlive) {
+  class DestructionTrackingResponseHeaderMap : public Http::TestResponseHeaderMapImpl {
+  public:
+    DestructionTrackingResponseHeaderMap(
+        std::initializer_list<std::pair<std::string, std::string>> values, bool& destroyed)
+        : Http::TestResponseHeaderMapImpl(values), destroyed_(destroyed) {}
+    ~DestructionTrackingResponseHeaderMap() override { destroyed_ = true; }
+
+  private:
+    bool& destroyed_;
+  };
+
+  auto encoder_filter = std::make_shared<NiceMock<Http::MockStreamEncoderFilter>>();
+  MockGenericUpstream* mock_upstream = nullptr;
+  GenericConnectionPoolCallbacks* pool_callbacks = nullptr;
+  startActiveUpstream(encoder_filter, nullptr, true, mock_upstream, pool_callbacks);
+
+  bool original_headers_destroyed = false;
+  bool destroyed_while_on_stack = false;
+  EXPECT_CALL(*encoder_filter, encodeHeaders(_, false))
+      .WillOnce([&](Http::ResponseHeaderMap&, bool) {
+        encoder_filter->callbacks_->sendLocalReply(Http::Code::BadGateway, "bad response", nullptr,
+                                                   std::nullopt, "encoder_local_reply");
+        destroyed_while_on_stack = original_headers_destroyed;
+        return Http::FilterHeadersStatus::StopIteration;
+      });
+  EXPECT_CALL(*mock_upstream, resetStream());
+  EXPECT_CALL(router_filter_interface_, onUpstreamHeaders(502, _, _, false));
+  EXPECT_CALL(router_filter_interface_, onUpstreamData(BufferString("bad response"), _, true));
+
+  auto original_headers = std::make_unique<DestructionTrackingResponseHeaderMap>(
+      std::initializer_list<std::pair<std::string, std::string>>{{":status", "200"}},
+      original_headers_destroyed);
+  pool_callbacks->upstreamToDownstream().decodeHeaders(std::move(original_headers), false);
+
+  EXPECT_FALSE(destroyed_while_on_stack);
+  upstream_request_.reset();
+  EXPECT_TRUE(original_headers_destroyed);
+}
+
+// When both last_upstream_tx_byte_sent_ and last_upstream_rx_byte_received_ are set,
+// UpstreamRequest::resetStream() skips resetting the completed codec stream, but must still call
+// clearRequestEncoder() so subsequent callbacks do not access a released upstream.
+TEST_F(UpstreamRequestTest, ResetStreamClearsRequestEncoderAfterUpstreamTxAndRxComplete) {
+  MockGenericUpstream* mock_upstream_ptr = nullptr;
+  UpstreamToDownstream* bridge = nullptr;
+  std::shared_ptr<UpstreamCodecFilter> codec_filter;
+  setupUpstreamAndGetBridge(mock_upstream_ptr, bridge, &codec_filter);
+
+  auto& time_system = router_filter_interface_.callbacks_.dispatcher_.globalTimeSystem();
+  auto& timing = upstream_request_->streamInfo().upstreamInfo()->upstreamTiming();
+  timing.onLastUpstreamTxByteSent(time_system);
+  timing.onFirstUpstreamRxByteReceived(time_system);
+  timing.onLastUpstreamRxByteReceived(time_system);
+
+  EXPECT_CALL(*mock_upstream_ptr, resetStream()).Times(0);
+  EXPECT_CALL(*mock_upstream_ptr, readDisable(_)).Times(0);
+  upstream_request_->resetStream();
+
+  codec_filter->onAboveWriteBufferHighWatermark();
+  codec_filter->onBelowWriteBufferLowWatermark();
+  upstream_request_.reset();
+}
+
 } // namespace
 } // namespace Router
 } // namespace Envoy
