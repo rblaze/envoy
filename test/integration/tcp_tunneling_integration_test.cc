@@ -10,6 +10,7 @@
 
 #include "test/integration/filters/add_header_filter.pb.h"
 #include "test/integration/filters/stop_and_continue_filter_config.pb.h"
+#include "test/integration/filters/test_filters.pb.h"
 #include "test/integration/http_integration.h"
 #include "test/integration/http_protocol_integration.h"
 #include "test/integration/tcp_tunneling_integration.h"
@@ -1005,6 +1006,35 @@ public:
     BaseTcpTunnelingIntegrationTest::SetUp();
   }
 
+  void modifyTcpProxyConfig(
+      std::function<void(envoy::extensions::filters::network::tcp_proxy::v3::TcpProxy&)> modifier) {
+    config_helper_.addConfigModifier([modifier = std::move(modifier)](
+                                         envoy::config::bootstrap::v3::Bootstrap& bootstrap) {
+      for (auto& listener : *bootstrap.mutable_static_resources()->mutable_listeners()) {
+        if (listener.name() != "tcp_proxy") {
+          continue;
+        }
+        auto* filter = listener.mutable_filter_chains(0)->mutable_filters(0);
+        auto proxy_config =
+            MessageUtil::anyConvert<envoy::extensions::filters::network::tcp_proxy::v3::TcpProxy>(
+                filter->typed_config());
+        modifier(proxy_config);
+        std::ignore = filter->mutable_typed_config()->PackFrom(proxy_config);
+      }
+    });
+  }
+
+  template <typename ConfigProto>
+  void initUpstreamTunnelFilter(absl::string_view name, const ConfigProto& config_proto) {
+    enableHalfClose(false);
+    HttpFilterProto filter_config;
+    filter_config.set_name(std::string(name));
+    std::ignore = filter_config.mutable_typed_config()->PackFrom(config_proto);
+    addHttpUpstreamFilterToCluster(filter_config);
+    addHttpUpstreamFilterToCluster(getCodecFilterConfig());
+    initialize();
+  }
+
   void enableRequestIdGeneration() {
     config_helper_.addConfigModifier(
         [&](envoy::config::bootstrap::v3::Bootstrap& bootstrap) -> void {
@@ -1190,6 +1220,50 @@ TEST_P(TcpTunnelingIntegrationTest, UpstreamHttpFiltersPauseAndResume) {
   } else {
     ASSERT_TRUE(upstream_request_->waitForEndStream(*dispatcher_));
   }
+}
+
+TEST_P(TcpTunnelingIntegrationTest, UpstreamHttpFiltersLocalReply) {
+  if (!GetParam().tunneling_with_upstream_filters) {
+    return;
+  }
+  modifyTcpProxyConfig(
+      [](auto& proxy_config) { proxy_config.mutable_max_connect_attempts()->set_value(2); });
+  initUpstreamTunnelFilter("local-reply-during-host-selection",
+                           test::integration::filters::LocalReplyDuringHostSelectionConfig());
+
+  tcp_client_ = makeTcpConnection(lookupPort("tcp_proxy"));
+  tcp_client_->waitForDisconnect();
+  EXPECT_EQ("", tcp_client_->data());
+}
+
+TEST_P(TcpTunnelingIntegrationTest, UpstreamHttpFiltersPreTunnelContinueAndResetStream) {
+  if (!GetParam().tunneling_with_upstream_filters) {
+    return;
+  }
+  modifyTcpProxyConfig([](auto& proxy_config) {
+    auto* header = proxy_config.mutable_tunneling_config()->add_headers_to_add()->mutable_header();
+    header->set_key("reset");
+    header->set_value("yes");
+  });
+  initUpstreamTunnelFilter("on-local-reply-filter",
+                           test::integration::filters::OnLocalReplyFilterConfig());
+
+  tcp_client_ = makeTcpConnection(lookupPort("tcp_proxy"));
+  tcp_client_->waitForDisconnect();
+  EXPECT_EQ("", tcp_client_->data());
+}
+
+TEST_P(TcpTunnelingIntegrationTest, UpstreamHttpFiltersPostTunnelLocalReplyResetsStream) {
+  if (!GetParam().tunneling_with_upstream_filters) {
+    return;
+  }
+  initUpstreamTunnelFilter("local-reply-during-encode-data",
+                           test::integration::filters::LocalReplyDuringEncodeDataConfig());
+
+  setUpConnection(fake_upstream_connection_);
+  upstream_request_->encodeData("payload", false);
+  tcp_client_->waitForDisconnect();
+  EXPECT_EQ("", tcp_client_->data());
 }
 
 TEST_P(TcpTunnelingIntegrationTest, SchemeHeader) {
