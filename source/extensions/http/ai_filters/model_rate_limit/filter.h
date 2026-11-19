@@ -79,6 +79,7 @@ private:
   HttpFilters::AiProtocolManager::AiFilterContext context_;
   std::string provider_;
   std::string model_;
+  uint64_t estimated_input_tokens_;
 };
 
 } // namespace ModelRateLimit

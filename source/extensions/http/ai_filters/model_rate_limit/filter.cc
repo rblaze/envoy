@@ -77,10 +77,10 @@ ModelRateLimitFilter::decode(HttpFilters::AiProtocolManager::AiRequestReceiver r
     co_return absl::OkStatus();
   }
 
-  const uint64_t estimated_input_tokens = getEstimatedInputTokens();
+  estimated_input_tokens_ = getEstimatedInputTokens();
   QuotaInterface* quotas = config_->quotas();
   absl::StatusOr<bool> allowed =
-      co_await quotas->checkLimits(provider_, model_, estimated_input_tokens);
+      co_await quotas->checkLimits(provider_, model_, estimated_input_tokens_);
 
   if (!allowed.ok()) {
     if (absl::IsCancelled(allowed.status())) {
@@ -103,7 +103,7 @@ ModelRateLimitFilter::decode(HttpFilters::AiProtocolManager::AiRequestReceiver r
 }
 
 Coroutine::Task<absl::Status> ModelRateLimitFilter::consumeQuota() const {
-  uint64_t input_tokens = getEstimatedInputTokens();
+  uint64_t input_tokens = estimated_input_tokens_;
   uint64_t output_tokens = 0;
 
   const auto& typed_metadata = context_.stream_info.dynamicMetadata().typed_filter_metadata();
