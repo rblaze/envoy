@@ -15,7 +15,7 @@
 #include "source/common/coroutine/task.h"
 #include "source/common/grpc/common.h"
 #include "source/common/tracing/http_tracer_impl.h"
-#include "source/extensions/http/ai_filters/model_router/async_rls.h"
+#include "source/extensions/http/ai_filters/model_rate_limit/async_rls.h"
 
 #include "test/common/coroutine/manual_executor.h"
 #include "test/mocks/grpc/mocks.h"
@@ -31,7 +31,7 @@
 namespace Envoy {
 namespace Extensions {
 namespace AiFilters {
-namespace ModelRouter {
+namespace ModelRateLimit {
 namespace {
 
 using envoy::service::ratelimit::v3::RateLimitRequest;
@@ -49,7 +49,7 @@ protected:
       : executor_(std::make_shared<Coroutine::ManualExecutor>()),
         mock_client_(std::make_shared<StrictMock<Grpc::MockAsyncClient>>()) {}
 
-  static RateLimitRequest makeRequest(const std::string& domain = "model_router") {
+  static RateLimitRequest makeRequest(const std::string& domain = "ai_model_routing") {
     RateLimitRequest req;
     req.set_domain(domain);
     auto* desc = req.add_descriptors();
@@ -310,7 +310,7 @@ TEST_F(AsyncRlsTest, ConcurrentInflightRequestsCompleteOutOfOrder) {
 }
 
 } // namespace
-} // namespace ModelRouter
+} // namespace ModelRateLimit
 } // namespace AiFilters
 } // namespace Extensions
 } // namespace Envoy

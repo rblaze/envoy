@@ -60,6 +60,7 @@ public:
         LlmRoute{
             LLMProtocol::OpenAiChatCompletions,
             "gpt-4o",
+            "openai",
             "api.openai.com",
             parseBinding("/v1/chat/completions"),
             "Bearer sk-openai-1",
@@ -67,6 +68,7 @@ public:
         LlmRoute{
             LLMProtocol::OpenAiResponses,
             "gpt-4.1",
+            "openai_responses",
             "api.openai.com",
             nullptr,
             "",
@@ -74,6 +76,7 @@ public:
         LlmRoute{
             LLMProtocol::GeminiGenerateContent,
             "gemini-2.5-pro",
+            "google",
             "generativelanguage.googleapis.com:443",
             parseBinding("/v1beta/models/{model}:{generateContent|streamGenerateContent}"),
             "gemini-key-123",
@@ -81,6 +84,7 @@ public:
         LlmRoute{
             LLMProtocol::Unspecified,
             "custom-model",
+            "custom",
             "custom.llm.local",
             nullptr,
             "",
@@ -134,6 +138,11 @@ public:
     return val.has_value() ? std::make_optional(std::string(*val)) : std::nullopt;
   }
 
+  std::optional<std::string> resolvedProvider() {
+    const auto val = stringFromFilterState(*stream_info_.filterState(), FilterStateKeys::Provider);
+    return val.has_value() ? std::make_optional(std::string(*val)) : std::nullopt;
+  }
+
   const LlmBindingObject* responseBindingObject() {
     return stream_info_.filterState()->getDataReadOnly<LlmBindingObject>(
         FilterStateKeys::BindingResponse);
@@ -142,6 +151,7 @@ public:
   void expectNoOutputFilterState() {
     EXPECT_EQ(responseProtocolObject(), nullptr);
     EXPECT_FALSE(resolvedModel().has_value());
+    EXPECT_FALSE(resolvedProvider().has_value());
     EXPECT_EQ(responseBindingObject(), nullptr);
   }
 
@@ -218,6 +228,7 @@ TEST_F(RouteSelectorFilterTest, SelectsRoutesAndUpdatesHeadersAndFilterStateAcro
   ASSERT_NE(responseProtocolObject(), nullptr);
   EXPECT_EQ(responseProtocolObject()->protocol(), LLMProtocol::OpenAiChatCompletions);
   EXPECT_EQ(resolvedModel(), "gpt-4o");
+  EXPECT_EQ(resolvedProvider(), "openai");
   ASSERT_NE(responseBindingObject(), nullptr);
   EXPECT_EQ((*responseBindingObject()->binding())->pattern()->source(), "/v1/chat/completions");
   EXPECT_EQ(request_headers_.getHostValue(), "api.openai.com");
@@ -231,6 +242,7 @@ TEST_F(RouteSelectorFilterTest, SelectsRoutesAndUpdatesHeadersAndFilterStateAcro
   EXPECT_FALSE(reply_code_.has_value());
   EXPECT_EQ(responseProtocolObject()->protocol(), LLMProtocol::OpenAiResponses);
   EXPECT_EQ(resolvedModel(), "gpt-4.1");
+  EXPECT_EQ(resolvedProvider(), "openai_responses");
   EXPECT_EQ(responseBindingObject(), nullptr);
   const auto cleared_binding = LlmBindingObject::fromFilterState(*stream_info_.filterState(),
                                                                  FilterStateKeys::BindingResponse);
@@ -246,6 +258,7 @@ TEST_F(RouteSelectorFilterTest, SelectsRoutesAndUpdatesHeadersAndFilterStateAcro
   EXPECT_FALSE(reply_code_.has_value());
   EXPECT_EQ(responseProtocolObject()->protocol(), LLMProtocol::GeminiGenerateContent);
   EXPECT_EQ(resolvedModel(), "gemini-2.5-pro");
+  EXPECT_EQ(resolvedProvider(), "google");
   ASSERT_NE(responseBindingObject(), nullptr);
   EXPECT_EQ((*responseBindingObject()->binding())->pattern()->source(),
             "/v1beta/models/{model}:{generateContent|streamGenerateContent}");

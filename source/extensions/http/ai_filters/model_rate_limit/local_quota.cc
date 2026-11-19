@@ -1,4 +1,4 @@
-#include "source/extensions/http/ai_filters/model_router/local_quota.h"
+#include "source/extensions/http/ai_filters/model_rate_limit/local_quota.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -8,14 +8,18 @@
 
 #include "source/common/protobuf/utility.h"
 
+#include "absl/container/flat_hash_set.h"
+#include "absl/status/status_macros.h"
+#include "absl/strings/str_cat.h"
+
 namespace Envoy {
 namespace Extensions {
 namespace AiFilters {
-namespace ModelRouter {
+namespace ModelRateLimit {
 
 namespace {
 
-namespace Config = envoy::extensions::http::ai_filters::model_router::v3;
+namespace Config = envoy::extensions::http::ai_filters::model_rate_limit::v3;
 
 double windowSeconds(Config::TimeUnit time_unit) {
   switch (time_unit) {
@@ -32,19 +36,31 @@ double windowSeconds(Config::TimeUnit time_unit) {
 
 } // namespace
 
-LocalQuota::LocalQuota(const Config::ModelRouter& proto, TimeSource& time_source)
-    : quotas_(buildQuotaMap(proto, time_source)) {}
+absl::StatusOr<LocalQuota> LocalQuota::create(const Config::ModelRateLimit& proto,
+                                              TimeSource& time_source) {
+  ABSL_ASSIGN_OR_RETURN(std::shared_ptr<const ModelQuotaMap> quotas,
+                        buildQuotaMap(proto, time_source));
+  return LocalQuota(std::move(quotas));
+}
 
-std::shared_ptr<const LocalQuota::ModelQuotaMap>
-LocalQuota::buildQuotaMap(const Config::ModelRouter& proto, TimeSource& time_source) {
+LocalQuota::LocalQuota(std::shared_ptr<const ModelQuotaMap> quotas) : quotas_(std::move(quotas)) {}
+
+absl::StatusOr<std::shared_ptr<const LocalQuota::ModelQuotaMap>>
+LocalQuota::buildQuotaMap(const Config::ModelRateLimit& proto, TimeSource& time_source) {
   auto map = std::make_shared<ModelQuotaMap>();
+  absl::flat_hash_set<ModelKey> seen_models;
 
-  for (const Config::Model& model_entry : proto.models()) {
+  for (const Config::ModelLimit& model_entry : proto.limits()) {
+    ModelKey key{model_entry.provider(), model_entry.model()};
+    if (!seen_models.insert(key).second) {
+      return absl::InvalidArgumentError(absl::StrCat("Duplicate model limit for provider ",
+                                                     key.provider, " and model ", key.model));
+    }
     if (model_entry.quotas().empty()) {
       continue;
     }
 
-    ModelQuotas& model_quotas = (*map)[ModelKey{model_entry.provider(), model_entry.model()}];
+    ModelQuotas& model_quotas = (*map)[std::move(key)];
     for (const Config::Quota& quota : model_entry.quotas()) {
       const uint64_t limit = quota.limit();
       const uint32_t multiplier = PROTOBUF_GET_WRAPPED_OR_DEFAULT(quota, unit_multiplier, 1);
@@ -120,7 +136,7 @@ Coroutine::Task<absl::Status> LocalQuota::consumeQuota(std::string provider, std
   co_return absl::OkStatus();
 }
 
-} // namespace ModelRouter
+} // namespace ModelRateLimit
 } // namespace AiFilters
 } // namespace Extensions
 } // namespace Envoy

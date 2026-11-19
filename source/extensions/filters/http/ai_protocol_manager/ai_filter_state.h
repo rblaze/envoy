@@ -42,6 +42,8 @@ constexpr absl::string_view ModelRequest = "envoy.ai.model.request";
 constexpr absl::string_view ModelResolved = "envoy.ai.model.resolved";
 // The list of LLM providers and models to try for this request.
 constexpr absl::string_view ResolvedRoutes = "envoy.ai.routes";
+// The provider used to serve this request. It is used for quota checks, when enabled.
+constexpr absl::string_view Provider = "envoy.ai.provider";
 } // namespace FilterStateKeys
 
 // A wire API held in filter state. It is created from and serializes as an LLMProtocol value name,
@@ -152,10 +154,10 @@ std::optional<absl::string_view> stringFromFilterState(const StreamInfo::FilterS
 struct LlmRoute {
   LLMProtocol llm_protocol{LLMProtocol::Unspecified};
   std::string model;
+  std::string provider;
   std::string host_and_port;
   LlmBindingConstSharedPtr binding;
   std::string api_key;
-  std::string provider;
 };
 
 // An ordered list of candidate routes stored at `FilterStateKeys::ResolvedRoutes`.

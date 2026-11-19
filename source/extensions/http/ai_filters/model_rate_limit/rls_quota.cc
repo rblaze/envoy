@@ -1,4 +1,4 @@
-#include "source/extensions/http/ai_filters/model_router/rls_quota.h"
+#include "source/extensions/http/ai_filters/model_rate_limit/rls_quota.h"
 
 #include <algorithm>
 #include <chrono>
@@ -15,18 +15,21 @@
 #include "source/common/coroutine/status_macros.h"
 #include "source/common/protobuf/utility.h"
 
+#include "absl/container/flat_hash_set.h"
 #include "absl/status/status.h"
+#include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 
 namespace Envoy {
 namespace Extensions {
 namespace AiFilters {
-namespace ModelRouter {
+namespace ModelRateLimit {
 
 namespace {
 
-namespace Config = envoy::extensions::http::ai_filters::model_router::v3;
+namespace Config = envoy::extensions::http::ai_filters::model_rate_limit::v3;
 using envoy::extensions::common::ratelimit::v3::RateLimitDescriptor;
 using envoy::service::ratelimit::v3::RateLimitRequest;
 using envoy::service::ratelimit::v3::RateLimitResponse;
@@ -72,24 +75,38 @@ void addDescriptor(RateLimitRequest& request, absl::string_view provider, absl::
 
 } // namespace
 
-RlsQuota::RlsQuota(const Config::ModelRouter& proto, const Config::RlsQuotaConfig& rls_config,
+absl::StatusOr<std::unique_ptr<RlsQuota>>
+RlsQuota::create(const Config::ModelRateLimit& proto, const Config::RlsQuotaConfig& rls_config,
+                 Grpc::RawAsyncClientSharedPtr async_client) {
+  ABSL_ASSIGN_OR_RETURN(std::shared_ptr<const ModelQuotaMap> quotas, buildQuotaMap(proto));
+  return std::make_unique<RlsQuota>(std::move(quotas), rls_config, std::move(async_client));
+}
+
+RlsQuota::RlsQuota(std::shared_ptr<const ModelQuotaMap> quotas,
+                   const Config::RlsQuotaConfig& rls_config,
                    Grpc::RawAsyncClientSharedPtr async_client)
-    : quotas_(buildQuotaMap(proto)),
+    : quotas_(std::move(quotas)),
       domain_(rls_config.domain().empty() ? std::string(DefaultDomain) : rls_config.domain()),
       client_(std::move(async_client),
               std::chrono::milliseconds(PROTOBUF_GET_MS_OR_DEFAULT(
                   rls_config, timeout, AsyncRlsClient::DefaultTimeout.count()))) {}
 
-std::shared_ptr<const RlsQuota::ModelQuotaMap>
-RlsQuota::buildQuotaMap(const Config::ModelRouter& proto) {
+absl::StatusOr<std::shared_ptr<const RlsQuota::ModelQuotaMap>>
+RlsQuota::buildQuotaMap(const Config::ModelRateLimit& proto) {
   auto map = std::make_shared<ModelQuotaMap>();
+  absl::flat_hash_set<ModelKey> seen_models;
 
-  for (const Config::Model& model_entry : proto.models()) {
+  for (const Config::ModelLimit& model_entry : proto.limits()) {
+    ModelKey key{model_entry.provider(), model_entry.model()};
+    if (!seen_models.insert(key).second) {
+      return absl::InvalidArgumentError(absl::StrCat("Duplicate model limit for provider ",
+                                                     key.provider, " and model ", key.model));
+    }
     if (model_entry.quotas().empty()) {
       continue;
     }
 
-    ModelQuotas& model_quotas = (*map)[ModelKey{model_entry.provider(), model_entry.model()}];
+    ModelQuotas& model_quotas = (*map)[std::move(key)];
     for (const Config::Quota& quota : model_entry.quotas()) {
       if (quota.limit() == 0) {
         model_quotas.disabled = true;
@@ -184,7 +201,7 @@ Coroutine::Task<absl::Status> RlsQuota::consumeQuota(std::string provider, std::
   co_return absl::OkStatus();
 }
 
-} // namespace ModelRouter
+} // namespace ModelRateLimit
 } // namespace AiFilters
 } // namespace Extensions
 } // namespace Envoy

@@ -5,11 +5,11 @@
 #include <string>
 #include <utility>
 
-#include "envoy/extensions/http/ai_filters/model_router/v3/model_router.pb.h"
+#include "envoy/extensions/http/ai_filters/model_rate_limit/v3/model_rate_limit.pb.h"
 
 #include "source/common/coroutine/launch.h"
 #include "source/common/coroutine/task.h"
-#include "source/extensions/http/ai_filters/model_router/local_quota.h"
+#include "source/extensions/http/ai_filters/model_rate_limit/local_quota.h"
 
 #include "test/common/coroutine/manual_executor.h"
 #include "test/test_common/simulated_time_system.h"
@@ -17,17 +17,20 @@
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "gmock/gmock.h"
 #include "gtest/gtest.h"
 
 namespace Envoy {
 namespace Extensions {
 namespace AiFilters {
-namespace ModelRouter {
+namespace ModelRateLimit {
 namespace {
 
-namespace Config = envoy::extensions::http::ai_filters::model_router::v3;
+namespace Config = envoy::extensions::http::ai_filters::model_rate_limit::v3;
+using StatusHelpers::HasStatus;
 using StatusHelpers::IsOk;
 using StatusHelpers::IsOkAndHolds;
+using testing::HasSubstr;
 
 class LocalQuotaTest : public Event::TestUsingSimulatedTime, public testing::Test {
 protected:
@@ -42,16 +45,21 @@ protected:
     return std::move(*result);
   }
 
-  static Config::Model* addModel(Config::ModelRouter& proto, const std::string& name,
-                                 const std::string& provider, const std::string& model) {
-    auto* m = proto.add_models();
-    m->set_name(name);
+  LocalQuota createQuota(const Config::ModelRateLimit& proto) {
+    auto quota_or = LocalQuota::create(proto, simTime());
+    RELEASE_ASSERT(quota_or.ok(), quota_or.status().ToString());
+    return std::move(*quota_or);
+  }
+
+  static Config::ModelLimit* addModelLimit(Config::ModelRateLimit& proto,
+                                           const std::string& provider, const std::string& model) {
+    auto* m = proto.add_limits();
     m->set_provider(provider);
     m->set_model(model);
     return m;
   }
 
-  static void addQuota(Config::Model& model, Config::QuotaType type, Config::TimeUnit unit,
+  static void addQuota(Config::ModelLimit& model, Config::QuotaType type, Config::TimeUnit unit,
                        uint32_t limit, uint32_t unit_multiplier = 0) {
     auto* q = model.add_quotas();
     q->set_quota_type(type);
@@ -64,10 +72,10 @@ protected:
 };
 
 TEST_F(LocalQuotaTest, AllowsUnconfiguredModelAndModelWithoutQuotas) {
-  Config::ModelRouter proto;
-  addModel(proto, "haiku", "anthropic", "claude-haiku-4-5");
+  Config::ModelRateLimit proto;
+  addModelLimit(proto, "anthropic", "claude-haiku-4-5");
 
-  LocalQuota quota(proto, simTime());
+  LocalQuota quota = createQuota(proto);
 
   EXPECT_THAT(runTask(quota.checkLimits("anthropic", "claude-haiku-4-5", 1000)),
               IsOkAndHolds(true));
@@ -77,15 +85,26 @@ TEST_F(LocalQuotaTest, AllowsUnconfiguredModelAndModelWithoutQuotas) {
   EXPECT_THAT(runTask(quota.consumeQuota("openai", "gpt-4o", 500, 500)), IsOk());
 }
 
+TEST_F(LocalQuotaTest, RejectsDuplicateModelLimit) {
+  Config::ModelRateLimit proto;
+  addModelLimit(proto, "openai", "gpt-4o");
+  auto* dup = addModelLimit(proto, "openai", "gpt-4o");
+  addQuota(*dup, Config::REQUESTS, Config::MINUTE, 10);
+
+  EXPECT_THAT(LocalQuota::create(proto, simTime()),
+              HasStatus(absl::StatusCode::kInvalidArgument,
+                        HasSubstr("Duplicate model limit for provider openai and model gpt-4o")));
+}
+
 TEST_F(LocalQuotaTest, ZeroLimitDisablesModel) {
-  Config::ModelRouter proto;
-  auto* req_disabled = addModel(proto, "gpt4o", "openai", "gpt-4o");
+  Config::ModelRateLimit proto;
+  auto* req_disabled = addModelLimit(proto, "openai", "gpt-4o");
   addQuota(*req_disabled, Config::REQUESTS, Config::MINUTE, 0);
 
-  auto* tok_disabled = addModel(proto, "sonnet", "anthropic", "claude-sonnet-4-5");
+  auto* tok_disabled = addModelLimit(proto, "anthropic", "claude-sonnet-4-5");
   addQuota(*tok_disabled, Config::TOKENS, Config::HOUR, 0);
 
-  LocalQuota quota(proto, simTime());
+  LocalQuota quota = createQuota(proto);
 
   EXPECT_THAT(runTask(quota.checkLimits("openai", "gpt-4o", 0)), IsOkAndHolds(false));
   EXPECT_THAT(runTask(quota.checkLimits("anthropic", "claude-sonnet-4-5", 0)), IsOkAndHolds(false));
@@ -101,11 +120,11 @@ TEST_F(LocalQuotaTest, ZeroLimitDisablesModel) {
 }
 
 TEST_F(LocalQuotaTest, EnforcesRequestsQuotaAndRefillsOverMinuteWindow) {
-  Config::ModelRouter proto;
-  auto* model = addModel(proto, "gpt4o", "openai", "gpt-4o");
+  Config::ModelRateLimit proto;
+  auto* model = addModelLimit(proto, "openai", "gpt-4o");
   addQuota(*model, Config::REQUESTS, Config::MINUTE, 2);
 
-  LocalQuota quota(proto, simTime());
+  LocalQuota quota = createQuota(proto);
 
   // checkLimits does not consume tokens by itself.
   EXPECT_THAT(runTask(quota.checkLimits("openai", "gpt-4o", 0)), IsOkAndHolds(true));
@@ -129,12 +148,12 @@ TEST_F(LocalQuotaTest, EnforcesRequestsQuotaAndRefillsOverMinuteWindow) {
 }
 
 TEST_F(LocalQuotaTest, EnforcesTokensQuotaAndHandlesNegativeDebt) {
-  Config::ModelRouter proto;
-  auto* model = addModel(proto, "gpt4o", "openai", "gpt-4o");
+  Config::ModelRateLimit proto;
+  auto* model = addModelLimit(proto, "openai", "gpt-4o");
   // 600 tokens per minute = 10 tokens per second.
   addQuota(*model, Config::TOKENS, Config::MINUTE, 600);
 
-  LocalQuota quota(proto, simTime());
+  LocalQuota quota = createQuota(proto);
 
   EXPECT_THAT(runTask(quota.checkLimits("openai", "gpt-4o", 600)), IsOkAndHolds(true));
   EXPECT_THAT(runTask(quota.checkLimits("openai", "gpt-4o", 601)), IsOkAndHolds(false));
@@ -162,14 +181,14 @@ TEST_F(LocalQuotaTest, EnforcesTokensQuotaAndHandlesNegativeDebt) {
 }
 
 TEST_F(LocalQuotaTest, EnforcesHourDayAndUnitMultiplierWindows) {
-  Config::ModelRouter proto;
-  auto* model = addModel(proto, "sonnet", "anthropic", "claude-sonnet-4-5");
+  Config::ModelRateLimit proto;
+  auto* model = addModelLimit(proto, "anthropic", "claude-sonnet-4-5");
   // 2 requests per 6 hours (1 request refills every 3 hours) and 86400 tokens per day (1
   // token/sec).
   addQuota(*model, Config::REQUESTS, Config::HOUR, 2, /*unit_multiplier=*/6);
   addQuota(*model, Config::TOKENS, Config::DAY, 86400);
 
-  LocalQuota quota(proto, simTime());
+  LocalQuota quota = createQuota(proto);
 
   // Consume both requests and 21600 tokens.
   EXPECT_THAT(runTask(quota.consumeQuota("anthropic", "claude-sonnet-4-5", 5000, 5800)), IsOk());
@@ -197,11 +216,11 @@ TEST_F(LocalQuotaTest, EnforcesHourDayAndUnitMultiplierWindows) {
 }
 
 TEST_F(LocalQuotaTest, SharesStateAcrossCopiedInstances) {
-  Config::ModelRouter proto;
-  auto* model = addModel(proto, "gemini_pro", "gemini", "gemini-2.5-pro");
+  Config::ModelRateLimit proto;
+  auto* model = addModelLimit(proto, "gemini", "gemini-2.5-pro");
   addQuota(*model, Config::REQUESTS, Config::MINUTE, 1);
 
-  LocalQuota base_quota(proto, simTime());
+  LocalQuota base_quota = createQuota(proto);
   LocalQuota thread_1_quota(base_quota);
   LocalQuota thread_2_quota(base_quota);
 
@@ -217,7 +236,7 @@ TEST_F(LocalQuotaTest, SharesStateAcrossCopiedInstances) {
 }
 
 } // namespace
-} // namespace ModelRouter
+} // namespace ModelRateLimit
 } // namespace AiFilters
 } // namespace Extensions
 } // namespace Envoy

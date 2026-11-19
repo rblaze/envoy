@@ -180,6 +180,17 @@ public:
 
 REGISTER_FACTORY(ResolvedModelObjectFactory, StreamInfo::FilterState::ObjectFactory);
 
+class ProviderObjectFactory : public StreamInfo::FilterState::ObjectFactory {
+public:
+  std::string name() const override { return std::string(FilterStateKeys::Provider); }
+  std::unique_ptr<StreamInfo::FilterState::Object>
+  createFromBytes(absl::string_view data) const override {
+    return stringFromBytes(data);
+  }
+};
+
+REGISTER_FACTORY(ProviderObjectFactory, StreamInfo::FilterState::ObjectFactory);
+
 } // namespace
 
 } // namespace AiProtocolManager

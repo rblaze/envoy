@@ -146,7 +146,8 @@ TEST(ResponseLlmProtocolTest, ResolvesFilterStateOverTheRoute) {
 class StringKeyFactoryTest : public testing::TestWithParam<absl::string_view> {};
 
 INSTANTIATE_TEST_SUITE_P(StringKeys, StringKeyFactoryTest,
-                         testing::Values(FilterStateKeys::ModelResolved));
+                         testing::Values(FilterStateKeys::ModelResolved,
+                                         FilterStateKeys::Provider));
 
 TEST_P(StringKeyFactoryTest, BuildsStringAccessorAndRejectsEmpty) {
   const auto* factory =

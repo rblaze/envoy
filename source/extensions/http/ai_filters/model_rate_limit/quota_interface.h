@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
 
 #include "envoy/common/pure.h"
 #include "envoy/thread_local/thread_local_object.h"
@@ -14,7 +15,20 @@
 namespace Envoy {
 namespace Extensions {
 namespace AiFilters {
-namespace ModelRouter {
+namespace ModelRateLimit {
+
+struct ModelKey {
+  std::string provider;
+  std::string model;
+
+  bool operator==(const ModelKey& other) const {
+    return provider == other.provider && model == other.model;
+  }
+
+  template <typename H> friend H AbslHashValue(H h, const ModelKey& key) {
+    return H::combine(std::move(h), key.provider, key.model);
+  }
+};
 
 class QuotaInterface : public Envoy::ThreadLocal::ThreadLocalObject {
 public:
@@ -31,7 +45,7 @@ public:
                                                      uint64_t output_tokens) PURE;
 };
 
-} // namespace ModelRouter
+} // namespace ModelRateLimit
 } // namespace AiFilters
 } // namespace Extensions
 } // namespace Envoy

@@ -1,4 +1,4 @@
-#include "source/extensions/http/ai_filters/model_router/async_rls.h"
+#include "source/extensions/http/ai_filters/model_rate_limit/async_rls.h"
 
 #include <chrono>
 #include <optional>
@@ -25,7 +25,7 @@
 namespace Envoy {
 namespace Extensions {
 namespace AiFilters {
-namespace ModelRouter {
+namespace ModelRateLimit {
 
 namespace {
 
@@ -132,7 +132,7 @@ AsyncRlsClient::consumeRateLimit(const RateLimitRequest& request) {
                                         timeout_);
 }
 
-} // namespace ModelRouter
+} // namespace ModelRateLimit
 } // namespace AiFilters
 } // namespace Extensions
 } // namespace Envoy

@@ -97,6 +97,10 @@ RouteSelectorFilter::decodeSync(HttpFilters::AiProtocolManager::AiRequest&,
                         std::make_shared<Router::StringAccessorImpl>(route.model),
                         StreamInfo::FilterState::LifeSpan::FilterChain);
 
+  filter_state->setData(FilterStateKeys::Provider,
+                        std::make_shared<Router::StringAccessorImpl>(route.provider),
+                        StreamInfo::FilterState::LifeSpan::FilterChain);
+
   filter_state->setData(FilterStateKeys::BindingResponse,
                         route.binding != nullptr ? std::make_shared<LlmBindingObject>(route.binding)
                                                  : nullptr,

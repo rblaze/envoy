@@ -13,7 +13,7 @@
 namespace Envoy {
 namespace Extensions {
 namespace AiFilters {
-namespace ModelRouter {
+namespace ModelRateLimit {
 
 class AsyncRlsClient {
 public:
@@ -39,7 +39,7 @@ private:
   std::chrono::milliseconds timeout_;
 };
 
-} // namespace ModelRouter
+} // namespace ModelRateLimit
 } // namespace AiFilters
 } // namespace Extensions
 } // namespace Envoy
