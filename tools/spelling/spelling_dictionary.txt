@@ -1005,7 +1005,6 @@ healths
 healthz
 hermeticity
 highp
-hiredis
 hl
 hit
 hoc
@@ -1243,7 +1242,6 @@ overridable
 oversized
 packagename
 pageheap
-parallelize
 param
 parameterization
 parameterize

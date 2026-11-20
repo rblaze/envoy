@@ -934,6 +934,28 @@
         }
       }
     },
+    "//bazel:extensions.bzl%envoy_module_graph_extension": {
+      "general": {
+        "bzlTransitiveDigest": "wCsTBFIiPuq8zch+8oblkZhZW9urtk6qCSA6AId4G4s=",
+        "usagesDigest": "a20U+l72r//DsxddmI97juCc5OVovDKHTOodwyV6/14=",
+        "recordedInputs": [
+          "REPO_MAPPING:,bazel_skylib bazel_skylib+",
+          "REPO_MAPPING:,bazel_tools bazel_tools",
+          "REPO_MAPPING:,cu +wasm_cargo+cu",
+          "REPO_MAPPING:,envoy_toolshed envoy_toolshed+",
+          "REPO_MAPPING:,rules_rust rules_rust+",
+          "REPO_MAPPING:rules_rust+,bazel_tools bazel_tools"
+        ],
+        "generatedRepoSpecs": {
+          "envoy_mod_graph": {
+            "repoRuleId": "@@//bazel:extensions.bzl%_envoy_mod_graph_repo",
+            "attributes": {
+              "lockfile": "@@//:MODULE.bazel.lock"
+            }
+          }
+        }
+      }
+    },
     "//bazel:extensions.bzl%envoy_repo_extension": {
       "general": {
         "bzlTransitiveDigest": "wCsTBFIiPuq8zch+8oblkZhZW9urtk6qCSA6AId4G4s=",
@@ -1072,6 +1094,83 @@
         }
       }
     },
+    "@@aspect_rules_js+//npm:extensions.bzl%pnpm": {
+      "general": {
+        "bzlTransitiveDigest": "PNe3/0HY1epelZv6BUsg9Rt8mY98XgMoBaB7BYPIkh8=",
+        "usagesDigest": "kbjSw2REjlSC0HtTZDf2p+l/dmiMt3NHLoiWEXYAoQI=",
+        "recordedInputs": [
+          "REPO_MAPPING:aspect_bazel_lib+,bazel_lib bazel_lib+",
+          "REPO_MAPPING:aspect_bazel_lib+,bazel_skylib bazel_skylib+",
+          "REPO_MAPPING:aspect_bazel_lib+,bazel_tools bazel_tools",
+          "REPO_MAPPING:aspect_bazel_lib+,tar.bzl tar.bzl+",
+          "REPO_MAPPING:aspect_rules_js+,aspect_bazel_lib aspect_bazel_lib+",
+          "REPO_MAPPING:aspect_rules_js+,aspect_rules_js aspect_rules_js+",
+          "REPO_MAPPING:aspect_rules_js+,bazel_features bazel_features+",
+          "REPO_MAPPING:aspect_rules_js+,bazel_skylib bazel_skylib+",
+          "REPO_MAPPING:aspect_rules_js+,bazel_tools bazel_tools",
+          "REPO_MAPPING:bazel_features+,bazel_features_globals bazel_features++version_extension+bazel_features_globals",
+          "REPO_MAPPING:bazel_features+,bazel_features_version bazel_features++version_extension+bazel_features_version",
+          "REPO_MAPPING:bazel_lib+,bazel_lib bazel_lib+",
+          "REPO_MAPPING:bazel_lib+,bazel_skylib bazel_skylib+",
+          "REPO_MAPPING:bazel_lib+,bazel_tools bazel_tools",
+          "REPO_MAPPING:tar.bzl+,aspect_bazel_lib aspect_bazel_lib+",
+          "REPO_MAPPING:tar.bzl+,bazel_skylib bazel_skylib+",
+          "REPO_MAPPING:tar.bzl+,tar.bzl tar.bzl+"
+        ],
+        "generatedRepoSpecs": {
+          "pnpm": {
+            "repoRuleId": "@@aspect_rules_js+//npm/private:npm_import.bzl%npm_import_rule",
+            "attributes": {
+              "package": "pnpm",
+              "version": "8.6.7",
+              "root_package": "",
+              "link_workspace": "",
+              "link_packages": {},
+              "integrity": "sha512-vRIWpD/L4phf9Bk2o/O2TDR8fFoJnpYrp2TKqTIZF/qZ2/rgL3qKXzHofHgbXsinwMoSEigz28sqk3pQ+yMEQQ==",
+              "url": "",
+              "commit": "",
+              "patch_args": [
+                "-p0"
+              ],
+              "patches": [],
+              "custom_postinstall": "",
+              "npm_auth": "",
+              "npm_auth_basic": "",
+              "npm_auth_username": "",
+              "npm_auth_password": "",
+              "lifecycle_hooks": [],
+              "extra_build_content": "load(\"@aspect_rules_js//js:defs.bzl\", \"js_binary\")\njs_binary(name = \"pnpm\", data = glob([\"package/**\"]), entry_point = \"package/dist/pnpm.cjs\", visibility = [\"//visibility:public\"])",
+              "extract_full_archive": true,
+              "exclude_package_contents": [],
+              "system_tar": "auto"
+            }
+          },
+          "pnpm__links": {
+            "repoRuleId": "@@aspect_rules_js+//npm/private:npm_import.bzl%npm_import_links",
+            "attributes": {
+              "package": "pnpm",
+              "version": "8.6.7",
+              "dev": false,
+              "root_package": "",
+              "link_packages": {},
+              "deps": {},
+              "transitive_closure": {},
+              "lifecycle_build_target": false,
+              "lifecycle_hooks_env": [],
+              "lifecycle_hooks_execution_requirements": [
+                "no-sandbox"
+              ],
+              "lifecycle_hooks_use_default_shell_env": false,
+              "bins": {},
+              "package_visibility": [
+                "//visibility:public"
+              ],
+              "exclude_package_contents": []
+            }
+          }
+        }
+      }
+    },
     "@@aspect_tools_telemetry+//:extension.bzl%telemetry": {
       "general": {
         "bzlTransitiveDigest": "9U/UW6moiJI22q2ERFWJSK1omQJqmQgMYfWCWNL+SXk=",
@@ -1088,6 +1187,198 @@
                 "aspect_rules_esbuild": "0.23.0",
                 "aspect_tools_telemetry": "0.2.6"
               }
+            }
+          }
+        }
+      }
+    },
+    "@@boost.headers+//:headers.bzl%archive": {
+      "general": {
+        "bzlTransitiveDigest": "DWEp/xr4WTzKph/F9a89DzBUizrJutxC8IeMeggovTU=",
+        "usagesDigest": "2Oga08yYemFJH6lPZu0UZ5aEPyczlxE8keijge197qM=",
+        "recordedInputs": [],
+        "generatedRepoSpecs": {
+          "boost_headers_archive": {
+            "repoRuleId": "@@boost.headers+//:headers.bzl%_archive_repository",
+            "attributes": {
+              "filename": "boost_1_89_0.tar.gz",
+              "sha256": "9de758db755e8330a01d995b0a24d09798048400ac25c03fc5ea9be364b13c93",
+              "url": "https://archives.boost.io/release/1.89.0/source/boost_1_89_0.tar.gz"
+            }
+          }
+        }
+      }
+    },
+    "@@emsdk+//:emscripten_cache.bzl%emscripten_cache": {
+      "general": {
+        "bzlTransitiveDigest": "uqDvXmpTNqW4+ie/Fk+xC3TrFrKvL+9hNtoP51Kt2oo=",
+        "usagesDigest": "tqMlVIpAFY/3agmeB8sd3h+NnW8g5Bb4Pei8lBIeN3Q=",
+        "recordedInputs": [],
+        "generatedRepoSpecs": {
+          "emscripten_cache": {
+            "repoRuleId": "@@emsdk+//:emscripten_cache.bzl%_emscripten_cache_repository",
+            "attributes": {
+              "configuration": [],
+              "targets": []
+            }
+          }
+        }
+      }
+    },
+    "@@emsdk+//:emscripten_deps.bzl%emscripten_deps": {
+      "general": {
+        "bzlTransitiveDigest": "y5B6h3PFmtcjJF+U0MFdZEWaulhsznXGqIc5x95yv6s=",
+        "usagesDigest": "UkYjyEB96a8Qjbl+R4LBgwf+MLOeeletlxBF22hcn1c=",
+        "recordedInputs": [
+          "REPO_MAPPING:bazel_features+,bazel_features_globals bazel_features++version_extension+bazel_features_globals",
+          "REPO_MAPPING:bazel_features+,bazel_features_version bazel_features++version_extension+bazel_features_version",
+          "REPO_MAPPING:bazel_tools,rules_cc rules_cc+",
+          "REPO_MAPPING:emsdk+,bazel_tools bazel_tools",
+          "REPO_MAPPING:emsdk+,rules_cc rules_cc+",
+          "REPO_MAPPING:rules_cc+,bazel_features bazel_features+",
+          "REPO_MAPPING:rules_cc+,bazel_skylib bazel_skylib+",
+          "REPO_MAPPING:rules_cc+,bazel_tools bazel_tools",
+          "REPO_MAPPING:rules_cc+,cc_compatibility_proxy rules_cc++compatibility_proxy+cc_compatibility_proxy",
+          "REPO_MAPPING:rules_cc+,com_google_protobuf protobuf+",
+          "REPO_MAPPING:rules_cc+,platforms platforms",
+          "REPO_MAPPING:rules_cc+,rules_cc rules_cc+",
+          "REPO_MAPPING:rules_cc++compatibility_proxy+cc_compatibility_proxy,rules_cc rules_cc+"
+        ],
+        "generatedRepoSpecs": {
+          "emscripten_bin_linux": {
+            "repoRuleId": "@@emsdk+//:remote_emscripten_repository.bzl%_emscripten_archive",
+            "attributes": {
+              "bin_extension": "",
+              "sha256": "5f1565fe45a1223cedf3b0300f5089c2c64954d2895b2aaedc85043c719be965",
+              "strip_prefix": "install",
+              "type": "tar.xz",
+              "url": "https://storage.googleapis.com/webassembly/emscripten-releases-builds/linux/aaa43392544d695232b70eda706d751f18980c2a/wasm-binaries.tar.xz"
+            }
+          },
+          "emscripten_bin_linux_arm64": {
+            "repoRuleId": "@@emsdk+//:remote_emscripten_repository.bzl%_emscripten_archive",
+            "attributes": {
+              "bin_extension": "",
+              "sha256": "d8ed075930b397d3aed8a1c7558db1918ade786349b07d5c042dfa7f65f78563",
+              "strip_prefix": "install",
+              "type": "tar.xz",
+              "url": "https://storage.googleapis.com/webassembly/emscripten-releases-builds/linux/aaa43392544d695232b70eda706d751f18980c2a/wasm-binaries-arm64.tar.xz"
+            }
+          },
+          "emscripten_bin_mac": {
+            "repoRuleId": "@@emsdk+//:remote_emscripten_repository.bzl%_emscripten_archive",
+            "attributes": {
+              "bin_extension": "",
+              "sha256": "5823ef26fd45b5a960960fb53026513d43922eac7a1e3ba12d1344d7a94699f9",
+              "strip_prefix": "install",
+              "type": "tar.xz",
+              "url": "https://storage.googleapis.com/webassembly/emscripten-releases-builds/mac/aaa43392544d695232b70eda706d751f18980c2a/wasm-binaries.tar.xz"
+            }
+          },
+          "emscripten_bin_mac_arm64": {
+            "repoRuleId": "@@emsdk+//:remote_emscripten_repository.bzl%_emscripten_archive",
+            "attributes": {
+              "bin_extension": "",
+              "sha256": "54234e108d6612eca5dc9280d1779ccec3d49ad4d8c8562a6b2046b0a5a8d5d4",
+              "strip_prefix": "install",
+              "type": "tar.xz",
+              "url": "https://storage.googleapis.com/webassembly/emscripten-releases-builds/mac/aaa43392544d695232b70eda706d751f18980c2a/wasm-binaries-arm64.tar.xz"
+            }
+          },
+          "emscripten_bin_win": {
+            "repoRuleId": "@@emsdk+//:remote_emscripten_repository.bzl%_emscripten_archive",
+            "attributes": {
+              "bin_extension": ".exe",
+              "sha256": "c2e1b9a2eed20f9d5903780b559ce2b384132713f07936512e6d962dd5a5dae6",
+              "strip_prefix": "install",
+              "type": "zip",
+              "url": "https://storage.googleapis.com/webassembly/emscripten-releases-builds/win/aaa43392544d695232b70eda706d751f18980c2a/wasm-binaries.zip"
+            }
+          }
+        }
+      }
+    },
+    "@@envoy_toolshed+//compile:extensions.bzl%libcxx_extension": {
+      "general": {
+        "bzlTransitiveDigest": "7YNzYsuvXtdKNMSRmLjM3JCbY+qcelCXlogCk23207w=",
+        "usagesDigest": "shjrhnP8xhvTNoOC+2+g3WwErlGzOUSsDVrBGvOjZLM=",
+        "recordedInputs": [],
+        "generatedRepoSpecs": {
+          "llvm_libcxx_aarch64": {
+            "repoRuleId": "@@envoy_toolshed+//compile:llvm_prebuilt.bzl%llvm_prebuilt",
+            "attributes": {
+              "sha256": "805efad2bb91cb4967fa569e0881d10c0f69c04461cf671cccbae19f547acc34",
+              "strip_prefix": "LLVM-22.1.8-Linux-ARM64/",
+              "url": "https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.8/LLVM-22.1.8-Linux-ARM64.tar.xz"
+            }
+          },
+          "llvm_libcxx_x86_64": {
+            "repoRuleId": "@@envoy_toolshed+//compile:llvm_prebuilt.bzl%llvm_prebuilt",
+            "attributes": {
+              "sha256": "df0e1ecf16caf3489a272a5eea4eec9b0d82878f6477fa309504f918a0006384",
+              "strip_prefix": "LLVM-22.1.8-Linux-X64/",
+              "url": "https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.8/LLVM-22.1.8-Linux-X64.tar.xz"
+            }
+          }
+        }
+      }
+    },
+    "@@envoy_toolshed+//compile:extensions.bzl%libcxx_libs_extension": {
+      "general": {
+        "bzlTransitiveDigest": "7YNzYsuvXtdKNMSRmLjM3JCbY+qcelCXlogCk23207w=",
+        "usagesDigest": "XSe62IH0/NKzYtClL3mLMJwZdTGpl6AAn1hqOeCmI0Y=",
+        "recordedInputs": [],
+        "generatedRepoSpecs": {
+          "libcxx_libs_aarch64": {
+            "repoRuleId": "@@envoy_toolshed+//compile:libcxx_libs.bzl%libcxx_libs",
+            "attributes": {
+              "version": "0.2.34",
+              "sha256": "b3bd8dfc1c250d5c2c36de174138ffef9754402b33e54abe9b5efb25982fa2f7",
+              "arch": "aarch64"
+            }
+          },
+          "libcxx_libs_x86_64": {
+            "repoRuleId": "@@envoy_toolshed+//compile:libcxx_libs.bzl%libcxx_libs",
+            "attributes": {
+              "version": "0.2.34",
+              "sha256": "e40f39338ffe561dfa26541557c9e548fc7760db9d99f7b6c5de237b725482aa",
+              "arch": "x86_64"
+            }
+          }
+        }
+      }
+    },
+    "@@envoy_toolshed+//compile:extensions.bzl%llvm_minimal_build_extension": {
+      "general": {
+        "bzlTransitiveDigest": "7YNzYsuvXtdKNMSRmLjM3JCbY+qcelCXlogCk23207w=",
+        "usagesDigest": "mRzCGGGrIdyd927gJUJ/JXkSwKskWp9MpS2H5whlvNg=",
+        "recordedInputs": [],
+        "generatedRepoSpecs": {
+          "llvm_tarball_linux_x86_64": {
+            "repoRuleId": "@@envoy_toolshed+//compile:llvm_minimal.bzl%llvm_tarball",
+            "attributes": {
+              "url": "https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.8/LLVM-22.1.8-Linux-X64.tar.xz",
+              "sha256": "df0e1ecf16caf3489a272a5eea4eec9b0d82878f6477fa309504f918a0006384",
+              "version": "22.1.8",
+              "platform": "Linux-X64"
+            }
+          },
+          "llvm_tarball_linux_arm64": {
+            "repoRuleId": "@@envoy_toolshed+//compile:llvm_minimal.bzl%llvm_tarball",
+            "attributes": {
+              "url": "https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.8/LLVM-22.1.8-Linux-ARM64.tar.xz",
+              "sha256": "805efad2bb91cb4967fa569e0881d10c0f69c04461cf671cccbae19f547acc34",
+              "version": "22.1.8",
+              "platform": "Linux-ARM64"
+            }
+          },
+          "llvm_tarball_macos_arm64": {
+            "repoRuleId": "@@envoy_toolshed+//compile:llvm_minimal.bzl%llvm_tarball",
+            "attributes": {
+              "url": "https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.8/LLVM-22.1.8-macOS-ARM64.tar.xz",
+              "sha256": "f260f4f7c0d430828a81ae8a3826a1d63fc0963ec2459489308cc23b1f7eab4f",
+              "version": "22.1.8",
+              "platform": "macOS-ARM64"
             }
           }
         }
@@ -1129,6 +1420,77 @@
               "minimal_linux_x64": "@@envoy_toolshed++llvm_toolchain_alias_extension+llvm_minimal_linux_x64//:BUILD.bazel",
               "minimal_linux_arm64": "@@envoy_toolshed++llvm_toolchain_alias_extension+llvm_minimal_linux_arm64//:BUILD.bazel",
               "minimal_macos_arm64": "@@envoy_toolshed++llvm_toolchain_alias_extension+llvm_minimal_macos_arm64//:BUILD.bazel"
+            }
+          }
+        }
+      }
+    },
+    "@@envoy_toolshed+//compile:extensions.bzl%sanitizer_extension": {
+      "general": {
+        "bzlTransitiveDigest": "7YNzYsuvXtdKNMSRmLjM3JCbY+qcelCXlogCk23207w=",
+        "usagesDigest": "au+8KDYOUR6+9hHsgBaq/be5tehXs/0JeMbWpsqrPRs=",
+        "recordedInputs": [],
+        "generatedRepoSpecs": {
+          "msan_libs": {
+            "repoRuleId": "@@envoy_toolshed+//compile:sanitizer_libs.bzl%msan_libs",
+            "attributes": {
+              "version": "0.2.34",
+              "sha256": "5538945e7113677fe90ea809bc15e90c4c573370e76eadf9c432b6936776d2e7"
+            }
+          },
+          "tsan_libs": {
+            "repoRuleId": "@@envoy_toolshed+//compile:sanitizer_libs.bzl%tsan_libs",
+            "attributes": {
+              "version": "0.2.34",
+              "sha256": "1af4d41cbe88c2c0bbb4611f57edbf8d933b432d501ccba7d4744105d785e81d"
+            }
+          }
+        }
+      }
+    },
+    "@@envoy_toolshed+//compile:extensions.bzl%unwind_extension": {
+      "general": {
+        "bzlTransitiveDigest": "7YNzYsuvXtdKNMSRmLjM3JCbY+qcelCXlogCk23207w=",
+        "usagesDigest": "K2cr0rbZIMDONrdn5K9UUnnaT2vCrxZxGbzmNpFWbpI=",
+        "recordedInputs": [],
+        "generatedRepoSpecs": {
+          "unwind_libs": {
+            "repoRuleId": "@@envoy_toolshed+//compile:unwind_libs.bzl%unwind_libs",
+            "attributes": {
+              "version": "0.2.34",
+              "sha256": "e51178035361876de4cbc26180dc896591ab86114c11b4520a711545dd698a68"
+            }
+          }
+        }
+      }
+    },
+    "@@envoy_toolshed+//coverage/grcov:extensions.bzl%grcov_extension": {
+      "general": {
+        "bzlTransitiveDigest": "QUP/WzigwonW/hjUKRYfJjp0K1WE0xufDbWc7EHFTVc=",
+        "usagesDigest": "vfSU9qRz9LktRgxF3ymXnFnlvEHl+bYxztN1e+Qrlm8=",
+        "recordedInputs": [
+          "REPO_MAPPING:envoy_toolshed+,bazel_tools bazel_tools"
+        ],
+        "generatedRepoSpecs": {
+          "grcov": {
+            "repoRuleId": "@@envoy_toolshed+//coverage/grcov:grcov_repository.bzl%_grcov_repo",
+            "attributes": {}
+          }
+        }
+      }
+    },
+    "@@envoy_toolshed+//coverage/lcov:extensions.bzl%lcov_merge_extension": {
+      "general": {
+        "bzlTransitiveDigest": "MZZWjIidnDgUiPw2Eu7QCUjoKJcAuTr8h1h4JhZ3qW0=",
+        "usagesDigest": "pJAD3rD1N3rZrYuN09hV9euIbyUQkF2PLjifUw5oKjM=",
+        "recordedInputs": [
+          "REPO_MAPPING:envoy_toolshed+,bazel_tools bazel_tools"
+        ],
+        "generatedRepoSpecs": {
+          "lcov_merge": {
+            "repoRuleId": "@@envoy_toolshed+//coverage/lcov:lcov_merge_repository.bzl%_lcov_merge_repo",
+            "attributes": {
+              "bins_release_version": "0.2.34"
             }
           }
         }
@@ -1324,6 +1686,248 @@
         }
       }
     },
+    "@@go-fips+//:go_fips_ext.bzl%go_fips_ext": {
+      "general": {
+        "bzlTransitiveDigest": "lMQIBNIBBHD/UxyWYiJUKSQj23kpxdWAO/1DuRGPBdg=",
+        "usagesDigest": "KD7U/Yu7/GNh9AFeLAMZ/hLUi1pfm9TI4UUrwGRsaBU=",
+        "recordedInputs": [],
+        "generatedRepoSpecs": {
+          "go_fips_host": {
+            "repoRuleId": "@@go-fips+//:go_fips.bzl%go_fips",
+            "attributes": {}
+          }
+        }
+      }
+    },
+    "@@googleapis+//:extensions.bzl%switched_rules": {
+      "general": {
+        "bzlTransitiveDigest": "1ZTg77R3Ks/ksx8QMNIoTRJetbJPRlzGFlJa9hoUn+Y=",
+        "usagesDigest": "ENbY7cA6Dq8i+MLmFyh8iUuqOOgsS08lNyoCC7tO8ck=",
+        "recordedInputs": [],
+        "generatedRepoSpecs": {}
+      }
+    },
+    "@@grpc+//bazel:extensions.bzl%exec_properties": {
+      "general": {
+        "bzlTransitiveDigest": "C9g6ijTS6Lje+XG5c5mDmAaZaTlui4lk3BEeg1bUjFA=",
+        "usagesDigest": "DxxfBGY1W38OkvKpXj7NuZtWDNWR5jqAS99gtmGPBaQ=",
+        "recordedInputs": [
+          "REPO_MAPPING:grpc+,bazel_toolchains grpc++http_archive+bazel_toolchains"
+        ],
+        "generatedRepoSpecs": {
+          "grpc_custom_exec_properties": {
+            "repoRuleId": "@@grpc++http_archive+bazel_toolchains//rules/exec_properties:exec_properties.bzl%_exec_property_sets_repository",
+            "attributes": {
+              "constants_bzl_content": "LARGE_MACHINE = {\"label:os\": \"ubuntu\", \"label:machine_size\": \"large\"}\n"
+            }
+          }
+        }
+      }
+    },
+    "@@grpc-httpjson-transcoding+//:extensions.bzl%non_module_deps": {
+      "general": {
+        "bzlTransitiveDigest": "02ggJeUkFbiGVMQajbL+H17AvhAsLjwrcru+C43n6zc=",
+        "usagesDigest": "oVWJd6S5cphvAtoXkvW+b2x4G9Rf1sPSQLjKaopbqak=",
+        "recordedInputs": [
+          "REPO_MAPPING:grpc-httpjson-transcoding+,bazel_tools bazel_tools"
+        ],
+        "generatedRepoSpecs": {
+          "com_google_googleapis": {
+            "repoRuleId": "@@bazel_tools//tools/build_defs/repo:http.bzl%http_archive",
+            "attributes": {
+              "url": "https://github.com/googleapis/googleapis/archive/1d5522ad1056f16a6d593b8f3038d831e64daeea.tar.gz",
+              "sha256": "cd13e547cffaad217c942084fd5ae0985a293d0cce3e788c20796e5e2ea54758",
+              "strip_prefix": "googleapis-1d5522ad1056f16a6d593b8f3038d831e64daeea"
+            }
+          }
+        }
+      }
+    },
+    "@@grpc-httpjson-transcoding+//:googleapis_ext.bzl%googleapis_ext": {
+      "general": {
+        "bzlTransitiveDigest": "sD14xQYn7Pgiz9+5CNHwqpHDZzAXas+gbAD68H9GyVI=",
+        "usagesDigest": "9/RQB2uMORJdPaxDgzW6OCvaHr18FBwqhUDLXCFcQPE=",
+        "recordedInputs": [
+          "REPO_MAPPING:grpc-httpjson-transcoding+,com_google_googleapis grpc-httpjson-transcoding++non_module_deps+com_google_googleapis"
+        ],
+        "generatedRepoSpecs": {
+          "com_google_googleapis_imports": {
+            "repoRuleId": "@@grpc-httpjson-transcoding++non_module_deps+com_google_googleapis//:repository_rules.bzl%switched_rules",
+            "attributes": {
+              "rules": {
+                "proto_library_with_info": [
+                  "",
+                  ""
+                ],
+                "moved_proto_library": [
+                  "",
+                  ""
+                ],
+                "java_proto_library": [
+                  "",
+                  ""
+                ],
+                "java_grpc_library": [
+                  "",
+                  ""
+                ],
+                "java_gapic_library": [
+                  "",
+                  ""
+                ],
+                "java_resource_name_proto_library": [
+                  "",
+                  ""
+                ],
+                "java_gapic_test": [
+                  "",
+                  ""
+                ],
+                "java_gapic_assembly_gradle_pkg": [
+                  "",
+                  ""
+                ],
+                "py_proto_library": [
+                  "",
+                  ""
+                ],
+                "py_grpc_library": [
+                  "",
+                  ""
+                ],
+                "py_gapic_library": [
+                  "",
+                  ""
+                ],
+                "py_gapic_assembly_pkg": [
+                  "",
+                  ""
+                ],
+                "py_gapic_library2": [
+                  "",
+                  "py_gapic_library"
+                ],
+                "py_gapic_assembly_pkg2": [
+                  "",
+                  "py_gapic_assembly_pkg"
+                ],
+                "go_proto_library": [
+                  "",
+                  ""
+                ],
+                "go_library": [
+                  "",
+                  ""
+                ],
+                "go_test": [
+                  "",
+                  ""
+                ],
+                "go_gapic_library": [
+                  "",
+                  ""
+                ],
+                "go_gapic_assembly_pkg": [
+                  "",
+                  ""
+                ],
+                "cc_proto_library": [
+                  "@com_google_protobuf//bazel:cc_proto_library.bzl",
+                  ""
+                ],
+                "cc_grpc_library": [
+                  "",
+                  ""
+                ],
+                "cc_gapic_library": [
+                  "",
+                  ""
+                ],
+                "php_proto_library": [
+                  "",
+                  ""
+                ],
+                "php_grpc_library": [
+                  "",
+                  ""
+                ],
+                "php_gapic_library": [
+                  "",
+                  ""
+                ],
+                "php_gapic_assembly_pkg": [
+                  "",
+                  ""
+                ],
+                "nodejs_gapic_library": [
+                  "",
+                  "typescript_gapic_library"
+                ],
+                "nodejs_gapic_assembly_pkg": [
+                  "",
+                  "typescript_gapic_assembly_pkg"
+                ],
+                "ruby_proto_library": [
+                  "",
+                  ""
+                ],
+                "ruby_grpc_library": [
+                  "",
+                  ""
+                ],
+                "ruby_gapic_library": [
+                  "",
+                  ""
+                ],
+                "ruby_ads_gapic_library": [
+                  "",
+                  ""
+                ],
+                "ruby_cloud_gapic_library": [
+                  "",
+                  ""
+                ],
+                "ruby_gapic_assembly_pkg": [
+                  "",
+                  ""
+                ],
+                "csharp_proto_library": [
+                  "",
+                  ""
+                ],
+                "csharp_grpc_library": [
+                  "",
+                  ""
+                ],
+                "csharp_gapic_library": [
+                  "",
+                  ""
+                ],
+                "csharp_gapic_assembly_pkg": [
+                  "",
+                  ""
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    "@@protobuf+//python/dist:system_python.bzl%system_python_extension": {
+      "general": {
+        "bzlTransitiveDigest": "qh0n9IrXU/xS94wxKQrG1J63zrLkA1Wy2Y3BQxptPcI=",
+        "usagesDigest": "DCJhR7LPgXJ//Na7lsN0d5+HulnHLKpkspMdWCAmYDU=",
+        "recordedInputs": [],
+        "generatedRepoSpecs": {
+          "system_python": {
+            "repoRuleId": "@@protobuf+//python/dist:system_python.bzl%system_python",
+            "attributes": {
+              "minimum_python_version": "3.9"
+            }
+          }
+        }
+      }
+    },
     "@@protoc-gen-validate+//bazel:prebuilt.bzl%prebuilt": {
       "general": {
         "bzlTransitiveDigest": "pUbDTz8ZORVxMXKpSw2Ep2tU+li8iSADfc+Tc4BU2io=",
@@ -1373,6 +1977,42 @@
               "platform": "windows_amd64",
               "sha256": "f4695fc6c243357dc0ef90fea630c15ef04aa2d4ce4343873056183095658f88",
               "version": "1.3.3"
+            }
+          }
+        }
+      }
+    },
+    "@@rules_android+//bzlmod_extensions:apksig.bzl%apksig_extension": {
+      "general": {
+        "bzlTransitiveDigest": "0A8O20aQTIZnt20CyMK1wzktVUyJO1Y3jI6cS1WftKQ=",
+        "usagesDigest": "zr/niBQ/s2fHozWAsg4vI70wAxcuFjG+QtM15qGkq9o=",
+        "recordedInputs": [
+          "REPO_MAPPING:rules_android+,bazel_tools bazel_tools"
+        ],
+        "generatedRepoSpecs": {
+          "apksig": {
+            "repoRuleId": "@@bazel_tools//tools/build_defs/repo:http.bzl%http_archive",
+            "attributes": {
+              "url": "https://android.googlesource.com/platform/tools/apksig/+archive/24e3075e68ebe17c0b529bb24bfda819db5e2f3b.tar.gz",
+              "build_file": "@@rules_android+//bzlmod_extensions:apksig.BUILD"
+            }
+          }
+        }
+      }
+    },
+    "@@rules_android+//bzlmod_extensions:com_android_dex.bzl%com_android_dex_extension": {
+      "general": {
+        "bzlTransitiveDigest": "stTLqB1DjqvC1RcosQO9gDBmAlvTegb/9MYDyiRNuFo=",
+        "usagesDigest": "c1Y/KGGjUYCyd8zNIVTUh1bynVXRFz6xGKaSCBpQANM=",
+        "recordedInputs": [
+          "REPO_MAPPING:rules_android+,bazel_tools bazel_tools"
+        ],
+        "generatedRepoSpecs": {
+          "com_android_dex": {
+            "repoRuleId": "@@bazel_tools//tools/build_defs/repo:http.bzl%http_archive",
+            "attributes": {
+              "url": "https://android.googlesource.com/platform/dalvik/+archive/5a81c499a569731e2395f7c8d13c0e0d4e17a2b6.tar.gz",
+              "build_file": "@@rules_android+//bzlmod_extensions:com_android_dex.BUILD"
             }
           }
         }
@@ -5704,6 +6344,109 @@
               "build_file_content": "###############################################################################\n# @generated\n# DO NOT MODIFY: This file is auto-generated by a crate_universe tool. To \n# regenerate this file, run the following:\n#\n#     bazel mod show_repo 'wasmtime'\n###############################################################################\n\nload(\"@rules_rust//cargo:defs.bzl\", \"cargo_toml_env_vars\")\n\nload(\"@rules_rust//rust:defs.bzl\", \"rust_library\")\n\n# buildifier: disable=bzl-visibility\nload(\"@rules_rust//crate_universe/private:selects.bzl\", \"selects\")\n\npackage(default_visibility = [\"//visibility:public\"])\n\ncargo_toml_env_vars(\n    name = \"cargo_toml_env_vars\",\n    src = \"Cargo.toml\",\n)\n\nrust_library(\n    name = \"windows_sys\",\n    deps = [\n        \"@cu__windows-link-0.2.1//:windows_link\",\n    ],\n    compile_data = glob(\n        allow_empty = True,\n        include = [\"**\"],\n        exclude = [\n            \"**/* *\",\n            \".tmp_git_root/**/*\",\n            \"BUILD\",\n            \"BUILD.bazel\",\n            \"WORKSPACE\",\n            \"WORKSPACE.bazel\",\n        ],\n    ),\n    crate_features = [\n        \"Win32\",\n        \"Win32_Foundation\",\n        \"Win32_Security\",\n        \"Win32_Storage\",\n        \"Win32_Storage_FileSystem\",\n        \"Win32_System\",\n        \"Win32_System_Diagnostics\",\n        \"Win32_System_Diagnostics_Debug\",\n        \"Win32_System_Kernel\",\n        \"Win32_System_Memory\",\n        \"Win32_System_SystemInformation\",\n        \"Win32_System_Threading\",\n        \"default\",\n    ],\n    crate_root = \"src/lib.rs\",\n    edition = \"2021\",\n    rustc_env_files = [\n        \":cargo_toml_env_vars\",\n    ],\n    rustc_flags = [\n        \"--cap-lints=allow\",\n    ],\n    srcs = glob(\n        allow_empty = True,\n        include = [\"**/*.rs\"],\n    ),\n    tags = [\n        \"cargo-bazel\",\n        \"crate-name=windows-sys\",\n        \"manual\",\n        \"noclippy\",\n        \"norustfmt\",\n    ],\n    target_compatible_with = select({\n        \"@rules_rust//rust/platform:aarch64-apple-darwin\": [],\n        \"@rules_rust//rust/platform:aarch64-unknown-linux-gnu\": [],\n        \"@rules_rust//rust/platform:wasm32-unknown-unknown\": [],\n        \"@rules_rust//rust/platform:wasm32-wasip1\": [],\n        \"@rules_rust//rust/platform:x86_64-pc-windows-msvc\": [],\n        \"@rules_rust//rust/platform:x86_64-unknown-linux-gnu\": [],\n        \"@rules_rust//rust/platform:x86_64-unknown-nixos-gnu\": [],\n        \"//conditions:default\": [\"@platforms//:incompatible\"],\n    }),\n    version = \"0.61.2\",\n)\n"
             }
           }
+        }
+      }
+    },
+    "@@rules_rust+//crate_universe/private:internal_extensions.bzl%cu_nr": {
+      "general": {
+        "bzlTransitiveDigest": "bwGx8lzzwHSdB5yH+wrcPJ6wkyvNEAjwrOqN7a4iUt4=",
+        "usagesDigest": "gPzbCKgzyeBCRrzMjhv2cAe139IR1vfEaSyXWN7MHJM=",
+        "recordedInputs": [
+          "REPO_MAPPING:apple_support+,bazel_skylib bazel_skylib+",
+          "REPO_MAPPING:bazel_features+,bazel_features_globals bazel_features++version_extension+bazel_features_globals",
+          "REPO_MAPPING:bazel_features+,bazel_features_version bazel_features++version_extension+bazel_features_version",
+          "REPO_MAPPING:rules_cc+,bazel_features bazel_features+",
+          "REPO_MAPPING:rules_cc+,bazel_skylib bazel_skylib+",
+          "REPO_MAPPING:rules_cc+,bazel_tools bazel_tools",
+          "REPO_MAPPING:rules_cc+,cc_compatibility_proxy rules_cc++compatibility_proxy+cc_compatibility_proxy",
+          "REPO_MAPPING:rules_cc+,platforms platforms",
+          "REPO_MAPPING:rules_cc+,rules_cc rules_cc+",
+          "REPO_MAPPING:rules_cc++compatibility_proxy+cc_compatibility_proxy,rules_cc rules_cc+",
+          "REPO_MAPPING:rules_rust+,apple_support apple_support+",
+          "REPO_MAPPING:rules_rust+,bazel_features bazel_features+",
+          "REPO_MAPPING:rules_rust+,bazel_skylib bazel_skylib+",
+          "REPO_MAPPING:rules_rust+,bazel_tools bazel_tools",
+          "REPO_MAPPING:rules_rust+,cui rules_rust++cu+cui",
+          "REPO_MAPPING:rules_rust+,rrc rules_rust++i2+rrc",
+          "REPO_MAPPING:rules_rust+,rules_cc rules_cc+",
+          "REPO_MAPPING:rules_rust+,rules_rust rules_rust+"
+        ],
+        "generatedRepoSpecs": {
+          "cargo_bazel_bootstrap": {
+            "repoRuleId": "@@rules_rust+//cargo/private:cargo_bootstrap.bzl%cargo_bootstrap_repository",
+            "attributes": {
+              "srcs": [
+                "@@rules_rust+//crate_universe:src/api.rs",
+                "@@rules_rust+//crate_universe:src/api/lockfile.rs",
+                "@@rules_rust+//crate_universe:src/cli.rs",
+                "@@rules_rust+//crate_universe:src/cli/generate.rs",
+                "@@rules_rust+//crate_universe:src/cli/query.rs",
+                "@@rules_rust+//crate_universe:src/cli/render.rs",
+                "@@rules_rust+//crate_universe:src/cli/splice.rs",
+                "@@rules_rust+//crate_universe:src/cli/vendor.rs",
+                "@@rules_rust+//crate_universe:src/config.rs",
+                "@@rules_rust+//crate_universe:src/config/label_injection.rs",
+                "@@rules_rust+//crate_universe:src/context.rs",
+                "@@rules_rust+//crate_universe:src/context/crate_context.rs",
+                "@@rules_rust+//crate_universe:src/context/platforms.rs",
+                "@@rules_rust+//crate_universe:src/lib.rs",
+                "@@rules_rust+//crate_universe:src/lockfile.rs",
+                "@@rules_rust+//crate_universe:src/main.rs",
+                "@@rules_rust+//crate_universe:src/metadata.rs",
+                "@@rules_rust+//crate_universe:src/metadata/cargo_bin.rs",
+                "@@rules_rust+//crate_universe:src/metadata/cargo_tree_resolver.rs",
+                "@@rules_rust+//crate_universe:src/metadata/cargo_tree_rustc_wrapper.bat",
+                "@@rules_rust+//crate_universe:src/metadata/cargo_tree_rustc_wrapper.sh",
+                "@@rules_rust+//crate_universe:src/metadata/dependency.rs",
+                "@@rules_rust+//crate_universe:src/metadata/metadata_annotation.rs",
+                "@@rules_rust+//crate_universe:src/rendering.rs",
+                "@@rules_rust+//crate_universe:src/rendering/template_engine.rs",
+                "@@rules_rust+//crate_universe:src/rendering/templates/defs_bzl_shim.j2",
+                "@@rules_rust+//crate_universe:src/rendering/templates/module_bzl.j2",
+                "@@rules_rust+//crate_universe:src/rendering/templates/partials/header.j2",
+                "@@rules_rust+//crate_universe:src/rendering/templates/partials/module/aliases_map.j2",
+                "@@rules_rust+//crate_universe:src/rendering/templates/partials/module/deps_map.j2",
+                "@@rules_rust+//crate_universe:src/rendering/templates/partials/module/repo_git.j2",
+                "@@rules_rust+//crate_universe:src/rendering/templates/partials/module/repo_http.j2",
+                "@@rules_rust+//crate_universe:src/rendering/verbatim/alias_rules.bzl",
+                "@@rules_rust+//crate_universe:src/select.rs",
+                "@@rules_rust+//crate_universe:src/splicing.rs",
+                "@@rules_rust+//crate_universe:src/splicing/cargo_config.rs",
+                "@@rules_rust+//crate_universe:src/splicing/crate_index_lookup.rs",
+                "@@rules_rust+//crate_universe:src/splicing/splicer.rs",
+                "@@rules_rust+//crate_universe:src/test.rs",
+                "@@rules_rust+//crate_universe:src/utils.rs",
+                "@@rules_rust+//crate_universe:src/utils/starlark.rs",
+                "@@rules_rust+//crate_universe:src/utils/starlark/glob.rs",
+                "@@rules_rust+//crate_universe:src/utils/starlark/label.rs",
+                "@@rules_rust+//crate_universe:src/utils/starlark/select.rs",
+                "@@rules_rust+//crate_universe:src/utils/starlark/select_dict.rs",
+                "@@rules_rust+//crate_universe:src/utils/starlark/select_list.rs",
+                "@@rules_rust+//crate_universe:src/utils/starlark/select_scalar.rs",
+                "@@rules_rust+//crate_universe:src/utils/starlark/select_set.rs",
+                "@@rules_rust+//crate_universe:src/utils/starlark/serialize.rs",
+                "@@rules_rust+//crate_universe:src/utils/starlark/target_compatible_with.rs",
+                "@@rules_rust+//crate_universe:src/utils/symlink.rs",
+                "@@rules_rust+//crate_universe:src/utils/target_triple.rs"
+              ],
+              "binary": "cargo-bazel",
+              "cargo_lockfile": "@@rules_rust+//crate_universe:Cargo.lock",
+              "cargo_toml": "@@rules_rust+//crate_universe:Cargo.toml",
+              "version": "1.98.0",
+              "rust_toolchain_cargo_template": "@rust_host_tools//:bin/{tool}",
+              "rust_toolchain_rustc_template": "@rust_host_tools//:bin/{tool}",
+              "compressed_windows_toolchain_names": false,
+              "timeout": 900
+            }
+          }
+        },
+        "moduleExtensionMetadata": {
+          "explicitRootModuleDirectDeps": [
+            "cargo_bazel_bootstrap"
+          ],
+          "explicitRootModuleDirectDevDeps": [],
+          "useAllRepos": "NO",
+          "reproducible": false
         }
       }
     },
