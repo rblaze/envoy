@@ -26,15 +26,23 @@ using HttpFilters::AiProtocolManager::stringFromFilterState;
 
 namespace {
 
-constexpr absl::string_view RequestInfoMetadataNamespace{"envoy.ai.request_info"};
-constexpr absl::string_view TokenUsageMetadataNamespace{"envoy.ai.token_usage"};
+constexpr absl::string_view DefaultRequestInfoMetadataNamespace{"envoy.ai.request_info"};
+constexpr absl::string_view DefaultTokenUsageMetadataNamespace{"envoy.ai.token_usage"};
 
 } // namespace
 
-ModelRateLimitFilterConfig::ModelRateLimitFilterConfig(QuotaPtr tl_quota, Stats::Scope& scope)
+ModelRateLimitFilterConfig::ModelRateLimitFilterConfig(
+    QuotaPtr tl_quota, Stats::Scope& scope, absl::string_view request_info_metadata_namespace,
+    absl::string_view token_usage_metadata_namespace)
     : tl_quota_(std::move(tl_quota)),
       stats_(ModelRateLimitFilterStats{ALL_MODEL_RATE_LIMIT_FILTER_STATS(
-          POOL_COUNTER_PREFIX(scope, "ai_protocol_manager.model_rate_limit."))}) {}
+          POOL_COUNTER_PREFIX(scope, "ai_protocol_manager.model_rate_limit."))}),
+      request_info_metadata_namespace_(request_info_metadata_namespace.empty()
+                                           ? std::string(DefaultRequestInfoMetadataNamespace)
+                                           : std::string(request_info_metadata_namespace)),
+      token_usage_metadata_namespace_(token_usage_metadata_namespace.empty()
+                                          ? std::string(DefaultTokenUsageMetadataNamespace)
+                                          : std::string(token_usage_metadata_namespace)) {}
 
 ModelRateLimitFilter::ModelRateLimitFilter(
     ModelRateLimitFilterConfigSharedPtr config,
@@ -43,7 +51,7 @@ ModelRateLimitFilter::ModelRateLimitFilter(
 
 uint64_t ModelRateLimitFilter::getEstimatedInputTokens() const {
   const auto& typed_metadata = context_.stream_info.dynamicMetadata().typed_filter_metadata();
-  const auto it = typed_metadata.find(RequestInfoMetadataNamespace);
+  const auto it = typed_metadata.find(config_->requestInfoMetadataNamespace());
   if (it == typed_metadata.end()) {
     return 0;
   }
@@ -107,7 +115,7 @@ Coroutine::Task<absl::Status> ModelRateLimitFilter::consumeQuota() const {
   uint64_t output_tokens = 0;
 
   const auto& typed_metadata = context_.stream_info.dynamicMetadata().typed_filter_metadata();
-  const auto it = typed_metadata.find(TokenUsageMetadataNamespace);
+  const auto it = typed_metadata.find(config_->tokenUsageMetadataNamespace());
   if (it != typed_metadata.end()) {
     envoy::data::ai::v3::TokenUsage token_usage;
     if (MessageUtil::unpackTo(it->second, token_usage).ok()) {

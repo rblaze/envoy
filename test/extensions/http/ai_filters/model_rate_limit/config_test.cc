@@ -34,10 +34,6 @@ using HttpFilters::AiProtocolManager::AiFilterFactoryCb;
 using HttpFilters::AiProtocolManager::LLMProtocol;
 using ModelRateLimitProto =
     envoy::extensions::http::ai_filters::model_rate_limit::v3::ModelRateLimit;
-using LocalQuotaConfigProto =
-    envoy::extensions::http::ai_filters::model_rate_limit::v3::LocalQuotaConfig;
-using RlsQuotaConfigProto =
-    envoy::extensions::http::ai_filters::model_rate_limit::v3::RlsQuotaConfig;
 using StatusHelpers::HasStatus;
 using testing::_;
 using testing::HasSubstr;
@@ -80,7 +76,8 @@ TEST_F(ModelRateLimitConfigTest, IsRegistered) {
 }
 
 TEST_F(ModelRateLimitConfigTest, CreatesFilterWithLocalAndRlsBackends) {
-  // 1. LocalQuotaConfig with multiple quota types, limit=0, and unit_multiplier.
+  // 1. LocalQuotaConfig with multiple quota types, limit=0, uint64 limit > UINT32_MAX,
+  // unit_multiplier, and custom metadata namespaces.
   {
     const auto factory_cb = createFactoryFromYaml(R"EOF(
 limits:
@@ -92,15 +89,14 @@ limits:
         limit: 0
       - quota_type: TOKENS
         time_unit: HOUR
-        limit: 10000
+        limit: 5000000000
         unit_multiplier: 6
       - quota_type: REQUESTS
         time_unit: DAY
         limit: 500
-backend:
-  name: local
-  typed_config:
-    "@type": type.googleapis.com/envoy.extensions.http.ai_filters.model_rate_limit.v3.LocalQuotaConfig
+local: {}
+request_info_metadata_namespace: custom.ai.request_info
+token_usage_metadata_namespace: custom.ai.token_usage
 )EOF");
     ASSERT_TRUE(factory_cb.ok()) << factory_cb.status();
 
@@ -110,19 +106,14 @@ backend:
     EXPECT_NE((*factory_cb)(stream_context), nullptr);
   }
 
-  // 2. RlsQuotaConfig with valid gRPC client and fallback when createUncachedRawAsyncClient fails.
-  for (bool raw_client_succeeds : {true, false}) {
-    auto async_client_factory = std::make_unique<StrictMock<Grpc::MockAsyncClientFactory>>();
-    if (raw_client_succeeds) {
-      EXPECT_CALL(*async_client_factory, createUncachedRawAsyncClient()).WillOnce([]() {
-        return std::make_unique<StrictMock<Grpc::MockAsyncClient>>();
-      });
-    } else {
-      EXPECT_CALL(*async_client_factory, createUncachedRawAsyncClient())
-          .WillOnce(Return(absl::UnavailableError("client unavailable")));
-    }
-    EXPECT_CALL(context_.cluster_manager_.async_client_manager_, factoryForGrpcService(_, _, true))
-        .WillOnce(Return(std::move(async_client_factory)));
+  // 2. RlsQuotaConfig creates cached per-thread gRPC client via
+  // getOrCreateRawAsyncClientWithHashKey.
+  {
+    auto mock_client = std::make_shared<StrictMock<Grpc::MockAsyncClient>>();
+    EXPECT_CALL(context_.cluster_manager_.async_client_manager_,
+                getOrCreateRawAsyncClientWithHashKey(_, _, true))
+        .Times(2)
+        .WillRepeatedly(Return(mock_client));
 
     const auto factory_cb = createFactoryFromYaml(R"EOF(
 limits:
@@ -132,15 +123,12 @@ limits:
       - quota_type: REQUESTS
         time_unit: MINUTE
         limit: 10
-backend:
-  name: rls
-  typed_config:
-    "@type": type.googleapis.com/envoy.extensions.http.ai_filters.model_rate_limit.v3.RlsQuotaConfig
-    grpc_service:
-      envoy_grpc:
-        cluster_name: rls_cluster
-    domain: custom_domain
-    timeout: 2s
+rls:
+  grpc_service:
+    envoy_grpc:
+      cluster_name: rls_cluster
+  domain: custom_domain
+  timeout: 2s
 )EOF");
     ASSERT_TRUE(factory_cb.ok()) << factory_cb.status();
 
@@ -157,29 +145,22 @@ TEST_F(ModelRateLimitConfigTest, RejectsSemanticConfigErrors) {
     std::string expected_error;
   };
   const std::vector<Case> cases = {
-      // Unknown backend typed_config type URL.
-      {R"EOF(
-backend:
-  name: unknown
-  typed_config:
-    "@type": type.googleapis.com/google.protobuf.Empty
-)EOF",
-       "Unknown backend type: google.protobuf.Empty"},
       // Duplicate (provider, model) with LocalQuotaConfig.
       {R"EOF(
 limits:
   - provider: openai
     model: gpt-4o
+    quotas:
+      - quota_type: REQUESTS
+        time_unit: MINUTE
+        limit: 5
   - provider: openai
     model: gpt-4o
     quotas:
       - quota_type: REQUESTS
         time_unit: MINUTE
         limit: 10
-backend:
-  name: local
-  typed_config:
-    "@type": type.googleapis.com/envoy.extensions.http.ai_filters.model_rate_limit.v3.LocalQuotaConfig
+local: {}
 )EOF",
        "Duplicate model limit for provider openai and model gpt-4o"},
       // Duplicate (provider, model) with RlsQuotaConfig.
@@ -187,17 +168,37 @@ backend:
 limits:
   - provider: anthropic
     model: claude-sonnet-4-5
+    quotas:
+      - quota_type: REQUESTS
+        time_unit: MINUTE
+        limit: 5
   - provider: anthropic
     model: claude-sonnet-4-5
-backend:
-  name: rls
-  typed_config:
-    "@type": type.googleapis.com/envoy.extensions.http.ai_filters.model_rate_limit.v3.RlsQuotaConfig
-    grpc_service:
-      envoy_grpc:
-        cluster_name: rls_cluster
+    quotas:
+      - quota_type: REQUESTS
+        time_unit: MINUTE
+        limit: 10
+rls:
+  grpc_service:
+    envoy_grpc:
+      cluster_name: rls_cluster
 )EOF",
        "Duplicate model limit for provider anthropic and model claude-sonnet-4-5"},
+      // RLS override limit exceeding UINT32_MAX.
+      {R"EOF(
+limits:
+  - provider: anthropic
+    model: claude-sonnet-4-5
+    quotas:
+      - quota_type: TOKENS
+        time_unit: DAY
+        limit: 5000000000
+rls:
+  grpc_service:
+    envoy_grpc:
+      cluster_name: rls_cluster
+)EOF",
+       "RLS quota override limit 5000000000 exceeds UINT32_MAX"},
   };
 
   for (const auto& c : cases) {
@@ -208,25 +209,23 @@ backend:
   }
 }
 
-TEST_F(ModelRateLimitConfigTest, PropagatesGrpcFactoryErrorForRlsConfig) {
-  EXPECT_CALL(context_.cluster_manager_.async_client_manager_, factoryForGrpcService(_, _, true))
+TEST_F(ModelRateLimitConfigTest, PropagatesGrpcClientCreationErrorForRlsConfig) {
+  EXPECT_CALL(context_.cluster_manager_.async_client_manager_,
+              getOrCreateRawAsyncClientWithHashKey(_, _, true))
       .WillOnce(Return(absl::InvalidArgumentError("invalid grpc service")));
 
   const auto factory_cb = createFactoryFromYaml(R"EOF(
-backend:
-  name: rls
-  typed_config:
-    "@type": type.googleapis.com/envoy.extensions.http.ai_filters.model_rate_limit.v3.RlsQuotaConfig
-    grpc_service:
-      envoy_grpc:
-        cluster_name: rls_cluster
+rls:
+  grpc_service:
+    envoy_grpc:
+      cluster_name: rls_cluster
 )EOF");
   EXPECT_THAT(factory_cb,
               HasStatus(absl::StatusCode::kInvalidArgument, HasSubstr("invalid grpc service")));
 }
 
 TEST_F(ModelRateLimitConfigTest, RejectsProtoValidationViolations) {
-  // Out-of-range QuotaType and TimeUnit enum values.
+  // Out-of-range QuotaType enum value.
   {
     ModelRateLimitProto proto;
     auto* limit = proto.add_limits();
@@ -237,8 +236,7 @@ TEST_F(ModelRateLimitConfigTest, RejectsProtoValidationViolations) {
         static_cast<envoy::extensions::http::ai_filters::model_rate_limit::v3::QuotaType>(999));
     quota->set_time_unit(envoy::extensions::http::ai_filters::model_rate_limit::v3::MINUTE);
     quota->set_limit(10);
-    proto.mutable_backend()->set_name("local");
-    ASSERT_TRUE(proto.mutable_backend()->mutable_typed_config()->PackFrom(LocalQuotaConfigProto{}));
+    proto.mutable_local();
     EXPECT_THROW_WITH_REGEX(createFactory(proto).IgnoreError(), EnvoyException,
                             "value must be one of the defined enum values");
   }
@@ -248,36 +246,42 @@ TEST_F(ModelRateLimitConfigTest, RejectsProtoValidationViolations) {
     std::string expected_regex;
   };
   const std::vector<YamlCase> cases = {
-      // Missing backend.
+      // Missing backend oneof.
       {R"EOF(
 limits: []
 )EOF",
-       "ModelRateLimitValidationError\\.Backend"},
-      // Empty backend TypedExtensionConfig.
-      {R"EOF(
-backend: {}
-)EOF",
-       "TypedExtensionConfigValidationError"},
+       R"(field: "backend", reason: is required)"},
       // Missing provider in ModelLimit.
       {R"EOF(
 limits:
   - model: gpt-4o
-backend:
-  name: local
-  typed_config:
-    "@type": type.googleapis.com/envoy.extensions.http.ai_filters.model_rate_limit.v3.LocalQuotaConfig
+    quotas:
+      - quota_type: REQUESTS
+        time_unit: MINUTE
+        limit: 10
+local: {}
 )EOF",
        "ModelLimitValidationError\\.Provider"},
       // Missing model in ModelLimit.
       {R"EOF(
 limits:
   - provider: openai
-backend:
-  name: local
-  typed_config:
-    "@type": type.googleapis.com/envoy.extensions.http.ai_filters.model_rate_limit.v3.LocalQuotaConfig
+    quotas:
+      - quota_type: REQUESTS
+        time_unit: MINUTE
+        limit: 10
+local: {}
 )EOF",
        "ModelLimitValidationError\\.Model"},
+      // Empty quotas in ModelLimit.
+      {R"EOF(
+limits:
+  - provider: openai
+    model: gpt-4o
+    quotas: []
+local: {}
+)EOF",
+       "ModelLimitValidationError\\.Quotas"},
       // QUOTA_UNSPECIFIED.
       {R"EOF(
 limits:
@@ -287,10 +291,7 @@ limits:
       - quota_type: QUOTA_UNSPECIFIED
         time_unit: MINUTE
         limit: 10
-backend:
-  name: local
-  typed_config:
-    "@type": type.googleapis.com/envoy.extensions.http.ai_filters.model_rate_limit.v3.LocalQuotaConfig
+local: {}
 )EOF",
        "QuotaValidationError\\.QuotaType"},
       // TIME_UNSPECIFIED.
@@ -302,10 +303,7 @@ limits:
       - quota_type: REQUESTS
         time_unit: TIME_UNSPECIFIED
         limit: 10
-backend:
-  name: local
-  typed_config:
-    "@type": type.googleapis.com/envoy.extensions.http.ai_filters.model_rate_limit.v3.LocalQuotaConfig
+local: {}
 )EOF",
        "QuotaValidationError\\.TimeUnit"},
       // unit_multiplier == 0.
@@ -318,30 +316,21 @@ limits:
         time_unit: HOUR
         limit: 10
         unit_multiplier: 0
-backend:
-  name: local
-  typed_config:
-    "@type": type.googleapis.com/envoy.extensions.http.ai_filters.model_rate_limit.v3.LocalQuotaConfig
+local: {}
 )EOF",
        "QuotaValidationError\\.UnitMultiplier"},
       // Missing grpc_service in RlsQuotaConfig.
       {R"EOF(
-backend:
-  name: rls
-  typed_config:
-    "@type": type.googleapis.com/envoy.extensions.http.ai_filters.model_rate_limit.v3.RlsQuotaConfig
+rls: {}
 )EOF",
        "RlsQuotaConfigValidationError\\.GrpcService"},
       // Zero timeout in RlsQuotaConfig.
       {R"EOF(
-backend:
-  name: rls
-  typed_config:
-    "@type": type.googleapis.com/envoy.extensions.http.ai_filters.model_rate_limit.v3.RlsQuotaConfig
-    grpc_service:
-      envoy_grpc:
-        cluster_name: rls_cluster
-    timeout: 0s
+rls:
+  grpc_service:
+    envoy_grpc:
+      cluster_name: rls_cluster
+  timeout: 0s
 )EOF",
        "RlsQuotaConfigValidationError\\.Timeout"},
   };

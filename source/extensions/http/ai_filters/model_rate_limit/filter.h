@@ -16,6 +16,7 @@
 #include "source/extensions/http/ai_filters/model_rate_limit/quota_interface.h"
 
 #include "absl/status/status.h"
+#include "absl/strings/string_view.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -40,14 +41,22 @@ class ModelRateLimitFilterConfig {
 public:
   using QuotaPtr = ThreadLocal::TypedSlotPtr<QuotaInterface>;
 
-  ModelRateLimitFilterConfig(QuotaPtr tl_quota, Stats::Scope& scope);
+  ModelRateLimitFilterConfig(QuotaPtr tl_quota, Stats::Scope& scope,
+                             absl::string_view request_info_metadata_namespace = "",
+                             absl::string_view token_usage_metadata_namespace = "");
 
   const ModelRateLimitFilterStats& stats() const { return stats_; }
   QuotaInterface* quotas() const { return tl_quota_->get().ptr(); }
+  absl::string_view requestInfoMetadataNamespace() const {
+    return request_info_metadata_namespace_;
+  }
+  absl::string_view tokenUsageMetadataNamespace() const { return token_usage_metadata_namespace_; }
 
 private:
   QuotaPtr tl_quota_;
   const ModelRateLimitFilterStats stats_;
+  const std::string request_info_metadata_namespace_;
+  const std::string token_usage_metadata_namespace_;
 };
 using ModelRateLimitFilterConfigSharedPtr = std::shared_ptr<const ModelRateLimitFilterConfig>;
 
@@ -79,7 +88,7 @@ private:
   HttpFilters::AiProtocolManager::AiFilterContext context_;
   std::string provider_;
   std::string model_;
-  uint64_t estimated_input_tokens_;
+  uint64_t estimated_input_tokens_{0};
 };
 
 } // namespace ModelRateLimit

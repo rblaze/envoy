@@ -455,6 +455,40 @@ TEST_F(ModelRateLimitFilterTest, ConsumeQuotaErrorIncrementsBackendErrorWithoutF
   EXPECT_EQ(counterValue("backend_error"), 1);
 }
 
+TEST_F(ModelRateLimitFilterTest, UsesConfiguredCustomMetadataNamespaces) {
+  auto slot = ThreadLocal::TypedSlot<QuotaInterface>::makeUnique(tls_);
+  slot->set([q = mock_quota_](Event::Dispatcher&) { return q; });
+  auto custom_config = std::make_shared<ModelRateLimitFilterConfig>(
+      std::move(slot), *stats_store_.rootScope(), "custom.ai.request_info",
+      "custom.ai.token_usage");
+
+  setResolvedModelAndProvider("openai", "gpt-4o");
+  // Populate conflicting values in default namespaces to ensure custom namespaces are read instead.
+  setEstimatedInputTokensInMetadata(999);
+  setTokenUsageInMetadata(888, 777);
+
+  envoy::data::ai::v3::RequestInfo custom_info;
+  custom_info.mutable_estimated_input_tokens()->set_value(64);
+  Protobuf::Any custom_info_any;
+  MessageUtil::packFrom(custom_info_any, custom_info);
+  stream_info_.setDynamicTypedMetadata("custom.ai.request_info", custom_info_any);
+
+  envoy::data::ai::v3::TokenUsage custom_usage;
+  custom_usage.mutable_input_tokens()->set_value(70);
+  custom_usage.mutable_output_tokens()->set_value(30);
+  Protobuf::Any custom_usage_any;
+  MessageUtil::packFrom(custom_usage_any, custom_usage);
+  stream_info_.setDynamicTypedMetadata("custom.ai.token_usage", custom_usage_any);
+
+  expectCheckLimits("openai", "gpt-4o", 64, true);
+  expectConsumeQuota("openai", "gpt-4o", 70, 30);
+
+  ModelRateLimitFilter filter(custom_config, AiFilterContext{stream_info_, request_headers_,
+                                                             LLMProtocol::OpenAiChatCompletions});
+  EXPECT_THAT(runDecode(filter), IsOk());
+  EXPECT_EQ(runEncode(filter, /*sse=*/false), 1);
+}
+
 TEST_F(ModelRateLimitFilterTest, EncodePropagatesStreamErrorsAndCancellationCleanly) {
   setResolvedModelAndProvider("anthropic", "claude-haiku-4-5");
   expectCheckLimits("anthropic", "claude-haiku-4-5", 0, true);

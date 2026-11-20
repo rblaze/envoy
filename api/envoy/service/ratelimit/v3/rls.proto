@@ -63,7 +63,7 @@ message RateLimitRequest {
   uint32 hits_addend = 3;
 }
 
-// A response from a ShouldRateLimit call.
+// A response from a ShouldRateLimit or CheckRateLimit call.
 // [#next-free-field: 8]
 message RateLimitResponse {
   option (udpa.annotations.versioning).previous_message_type =

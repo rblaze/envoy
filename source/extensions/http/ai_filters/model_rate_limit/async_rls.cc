@@ -58,10 +58,10 @@ class GrpcUnaryAwaitable : public Coroutine::LeafAwaitable<absl::StatusOr<RateLi
 public:
   GrpcUnaryAwaitable(Grpc::RawAsyncClient* raw_client,
                      Grpc::AsyncClient<RateLimitRequest, RateLimitResponse>& async_client,
-                     const Protobuf::MethodDescriptor& method, const RateLimitRequest& request,
+                     const Protobuf::MethodDescriptor& method, RateLimitRequest request,
                      std::chrono::milliseconds timeout)
-      : raw_client_(raw_client), async_client_(async_client), method_(method), request_(request),
-        timeout_(timeout) {}
+      : raw_client_(raw_client), async_client_(async_client), method_(method),
+        request_(std::move(request)), timeout_(timeout) {}
 
   ~GrpcUnaryAwaitable() override {
     if (inflight_request_ != nullptr) {
@@ -107,7 +107,7 @@ private:
   Grpc::RawAsyncClient* raw_client_;
   Grpc::AsyncClient<RateLimitRequest, RateLimitResponse>& async_client_;
   const Protobuf::MethodDescriptor& method_;
-  const RateLimitRequest& request_;
+  const RateLimitRequest request_;
   std::chrono::milliseconds timeout_;
   Grpc::AsyncRequest* inflight_request_{nullptr};
 };
@@ -119,17 +119,17 @@ AsyncRlsClient::AsyncRlsClient(Grpc::RawAsyncClientSharedPtr async_client,
     : raw_client_(async_client), async_client_(std::move(async_client)), timeout_(timeout) {}
 
 Coroutine::Task<absl::StatusOr<RateLimitResponse>>
-AsyncRlsClient::checkRateLimit(const RateLimitRequest& request) {
+AsyncRlsClient::checkRateLimit(RateLimitRequest request) {
   static const Protobuf::MethodDescriptor& method = getMethodDescriptor(CheckMethodName);
-  co_return co_await GrpcUnaryAwaitable(raw_client_.get(), async_client_, method, request,
-                                        timeout_);
+  co_return co_await GrpcUnaryAwaitable(raw_client_.get(), async_client_, method,
+                                        std::move(request), timeout_);
 }
 
 Coroutine::Task<absl::StatusOr<RateLimitResponse>>
-AsyncRlsClient::consumeRateLimit(const RateLimitRequest& request) {
+AsyncRlsClient::consumeRateLimit(RateLimitRequest request) {
   static const Protobuf::MethodDescriptor& method = getMethodDescriptor(ConsumeMethodName);
-  co_return co_await GrpcUnaryAwaitable(raw_client_.get(), async_client_, method, request,
-                                        timeout_);
+  co_return co_await GrpcUnaryAwaitable(raw_client_.get(), async_client_, method,
+                                        std::move(request), timeout_);
 }
 
 } // namespace ModelRateLimit

@@ -74,6 +74,14 @@ public:
             "",
         },
         LlmRoute{
+            LLMProtocol::AnthropicMessages,
+            "claude-haiku-4-5",
+            "anthropic",
+            "api.anthropic.com",
+            parseBinding("/v1/messages"),
+            "Bearer sk-anthropic",
+        },
+        LlmRoute{
             LLMProtocol::GeminiGenerateContent,
             "gemini-2.5-pro",
             "google",
@@ -194,8 +202,8 @@ TEST_F(RouteSelectorFilterTest, MissingOrInvalidAttemptCount) {
   expectNoOutputFilterState();
   EXPECT_EQ(counterValue("invalid_route_data"), 2);
 
-  // Attempt count out of bounds (4 routes configured, attempt 5 requested).
-  run(5);
+  // Attempt count out of bounds (5 routes configured, attempt 6 requested).
+  run(6);
   expectLocalReply(Http::Code::InternalServerError, "Invalid LLM request attempt");
   expectNoOutputFilterState();
   EXPECT_EQ(counterValue("invalid_route_data"), 3);
@@ -203,7 +211,7 @@ TEST_F(RouteSelectorFilterTest, MissingOrInvalidAttemptCount) {
 
 TEST_F(RouteSelectorFilterTest, RejectsUnspecifiedProtocol) {
   populateRoutesInFilterState();
-  run(4, {{"authorization", "Bearer client-token"}});
+  run(5, {{"authorization", "Bearer client-token"}});
 
   expectLocalReply(Http::Code::InternalServerError, "Invalid LLM protocol");
   expectNoOutputFilterState();
@@ -253,8 +261,22 @@ TEST_F(RouteSelectorFilterTest, SelectsRoutesAndUpdatesHeadersAndFilterStateAcro
   EXPECT_FALSE(request_headers_.has("x-goog-api-key"));
   EXPECT_FALSE(request_headers_.has("x-api-key"));
 
-  // Attempt 3: Gemini Generate Content sets x-goog-api-key and strips Authorization and x-api-key.
+  // Attempt 3: Anthropic Messages sets Authorization and binding, and strips x-goog-api-key and
+  // x-api-key.
   run(3, stale_headers);
+  EXPECT_FALSE(reply_code_.has_value());
+  EXPECT_EQ(responseProtocolObject()->protocol(), LLMProtocol::AnthropicMessages);
+  EXPECT_EQ(resolvedModel(), "claude-haiku-4-5");
+  EXPECT_EQ(resolvedProvider(), "anthropic");
+  ASSERT_NE(responseBindingObject(), nullptr);
+  EXPECT_EQ((*responseBindingObject()->binding())->pattern()->source(), "/v1/messages");
+  EXPECT_EQ(request_headers_.getHostValue(), "api.anthropic.com");
+  EXPECT_EQ(request_headers_.get_("authorization"), "Bearer sk-anthropic");
+  EXPECT_FALSE(request_headers_.has("x-goog-api-key"));
+  EXPECT_FALSE(request_headers_.has("x-api-key"));
+
+  // Attempt 4: Gemini Generate Content sets x-goog-api-key and strips Authorization and x-api-key.
+  run(4, stale_headers);
   EXPECT_FALSE(reply_code_.has_value());
   EXPECT_EQ(responseProtocolObject()->protocol(), LLMProtocol::GeminiGenerateContent);
   EXPECT_EQ(resolvedModel(), "gemini-2.5-pro");
@@ -267,7 +289,7 @@ TEST_F(RouteSelectorFilterTest, SelectsRoutesAndUpdatesHeadersAndFilterStateAcro
   EXPECT_FALSE(request_headers_.has("authorization"));
   EXPECT_FALSE(request_headers_.has("x-api-key"));
 
-  EXPECT_EQ(counterValue("success"), 3);
+  EXPECT_EQ(counterValue("success"), 4);
   EXPECT_EQ(counterValue("invalid_route_data"), 0);
 }
 

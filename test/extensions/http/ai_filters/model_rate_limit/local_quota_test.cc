@@ -60,7 +60,7 @@ protected:
   }
 
   static void addQuota(Config::ModelLimit& model, Config::QuotaType type, Config::TimeUnit unit,
-                       uint32_t limit, uint32_t unit_multiplier = 0) {
+                       uint64_t limit, uint32_t unit_multiplier = 0) {
     auto* q = model.add_quotas();
     q->set_quota_type(type);
     q->set_time_unit(unit);
@@ -87,13 +87,31 @@ TEST_F(LocalQuotaTest, AllowsUnconfiguredModelAndModelWithoutQuotas) {
 
 TEST_F(LocalQuotaTest, RejectsDuplicateModelLimit) {
   Config::ModelRateLimit proto;
-  addModelLimit(proto, "openai", "gpt-4o");
+  auto* first = addModelLimit(proto, "openai", "gpt-4o");
+  addQuota(*first, Config::REQUESTS, Config::MINUTE, 5);
   auto* dup = addModelLimit(proto, "openai", "gpt-4o");
   addQuota(*dup, Config::REQUESTS, Config::MINUTE, 10);
 
   EXPECT_THAT(LocalQuota::create(proto, simTime()),
               HasStatus(absl::StatusCode::kInvalidArgument,
                         HasSubstr("Duplicate model limit for provider openai and model gpt-4o")));
+}
+
+TEST_F(LocalQuotaTest, SupportsUint64LimitAboveUint32Max) {
+  Config::ModelRateLimit proto;
+  auto* model = addModelLimit(proto, "openai", "gpt-4o");
+  constexpr uint64_t kFiveBillionTokens = 5'000'000'000ULL;
+  addQuota(*model, Config::TOKENS, Config::DAY, kFiveBillionTokens);
+
+  LocalQuota quota = createQuota(proto);
+
+  EXPECT_THAT(runTask(quota.checkLimits("openai", "gpt-4o", kFiveBillionTokens)),
+              IsOkAndHolds(true));
+  EXPECT_THAT(runTask(quota.checkLimits("openai", "gpt-4o", kFiveBillionTokens + 1)),
+              IsOkAndHolds(false));
+  EXPECT_THAT(runTask(quota.consumeQuota("openai", "gpt-4o", 3'000'000'000ULL, 2'000'000'000ULL)),
+              IsOk());
+  EXPECT_THAT(runTask(quota.checkLimits("openai", "gpt-4o", 1)), IsOkAndHolds(false));
 }
 
 TEST_F(LocalQuotaTest, ZeroLimitDisablesModel) {

@@ -1,5 +1,6 @@
 #include <chrono>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -79,7 +80,7 @@ protected:
   }
 
   static void addQuota(Config::ModelLimit& model, Config::QuotaType type, Config::TimeUnit unit,
-                       uint32_t limit, uint32_t unit_multiplier = 0) {
+                       uint64_t limit, uint32_t unit_multiplier = 0) {
     auto* q = model.add_quotas();
     q->set_quota_type(type);
     q->set_time_unit(unit);
@@ -145,7 +146,8 @@ protected:
 
 TEST_F(RlsQuotaTest, RejectsDuplicateModelLimit) {
   Config::ModelRateLimit proto;
-  addModelLimit(proto, "anthropic", "claude-haiku-4-5");
+  auto* first = addModelLimit(proto, "anthropic", "claude-haiku-4-5");
+  addQuota(*first, Config::REQUESTS, Config::MINUTE, 10);
   auto* dup = addModelLimit(proto, "anthropic", "claude-haiku-4-5");
   addQuota(*dup, Config::REQUESTS, Config::MINUTE, 5);
 
@@ -155,9 +157,23 @@ TEST_F(RlsQuotaTest, RejectsDuplicateModelLimit) {
                                   "claude-haiku-4-5")));
 }
 
+TEST_F(RlsQuotaTest, RejectsLimitExceedingUint32Max) {
+  Config::ModelRateLimit proto;
+  auto* model = addModelLimit(proto, "openai", "gpt-4o");
+  addQuota(*model, Config::TOKENS, Config::DAY,
+           static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()) + 1);
+
+  EXPECT_THAT(
+      RlsQuota::create(proto, Config::RlsQuotaConfig{}, mock_client_),
+      HasStatus(absl::StatusCode::kInvalidArgument,
+                HasSubstr("RLS quota override limit 4294967296 exceeds UINT32_MAX for provider "
+                          "openai and model gpt-4o")));
+}
+
 TEST_F(RlsQuotaTest, QueriesRlsWithDefaultDescriptorsWhenModelQuotasNotConfigured) {
   Config::ModelRateLimit proto;
-  addModelLimit(proto, "anthropic", "claude-haiku-4-5");
+  auto* other_model = addModelLimit(proto, "openai", "gpt-4o");
+  addQuota(*other_model, Config::REQUESTS, Config::MINUTE, 5);
 
   auto quota = createQuota(proto);
 
@@ -260,15 +276,66 @@ TEST_F(RlsQuotaTest, ZeroLimitDisablesModelWithoutRpc) {
   EXPECT_THAT(runTask(quota->consumeQuota("anthropic", "claude-sonnet-4-5", 10, 10)), IsOk());
 }
 
-TEST_F(RlsQuotaTest, ModelWithOnlyTokenQuotasZeroTokensConsumeIsNoOp) {
+TEST_F(RlsQuotaTest, PartialModelLimitOverridesKeepDefaultDescriptorForUnoverriddenQuotaType) {
   Config::ModelRateLimit proto;
-  auto* model = addModelLimit(proto, "openai", "gpt-4o");
-  addQuota(*model, Config::TOKENS, Config::MINUTE, 1000);
+  auto* req_only = addModelLimit(proto, "openai", "gpt-4o");
+  addQuota(*req_only, Config::REQUESTS, Config::MINUTE, 10);
+
+  auto* tok_only = addModelLimit(proto, "anthropic", "claude-sonnet-4-5");
+  addQuota(*tok_only, Config::TOKENS, Config::MINUTE, 1000);
 
   auto quota = createQuota(proto);
 
-  // No request quotas and 0 tokens consumed -> no RPC issued.
-  EXPECT_THAT(runTask(quota->consumeQuota("openai", "gpt-4o", 0, 0)), IsOk());
+  // 1. Model with only REQUESTS override still sends default tokens descriptor on check and
+  // consume.
+  RateLimitRequest expected_req_only_check;
+  expected_req_only_check.set_domain("ai_model_routing");
+  addExpectedDescriptor(expected_req_only_check, "openai", "gpt-4o", "requests", 1,
+                        envoy::type::v3::MINUTE, 10, 1);
+  addExpectedDescriptor(expected_req_only_check, "openai", "gpt-4o", "tokens", 250);
+  expectRlsCall("CheckRateLimit", expected_req_only_check, RateLimitResponse::OK);
+  EXPECT_THAT(runTask(quota->checkLimits("openai", "gpt-4o", 250)), IsOkAndHolds(true));
+
+  RateLimitRequest expected_req_only_consume;
+  expected_req_only_consume.set_domain("ai_model_routing");
+  addExpectedDescriptor(expected_req_only_consume, "openai", "gpt-4o", "requests", 1,
+                        envoy::type::v3::MINUTE, 10, 1);
+  addExpectedDescriptor(expected_req_only_consume, "openai", "gpt-4o", "tokens", 150);
+  expectRlsCall("ConsumeRateLimit", expected_req_only_consume);
+  EXPECT_THAT(runTask(quota->consumeQuota("openai", "gpt-4o", 100, 50)), IsOk());
+
+  // 2. Model with only TOKENS override still sends default requests descriptor on check and
+  // consume (even when 0 tokens are consumed).
+  RateLimitRequest expected_tok_only_check;
+  expected_tok_only_check.set_domain("ai_model_routing");
+  addExpectedDescriptor(expected_tok_only_check, "anthropic", "claude-sonnet-4-5", "requests", 1);
+  addExpectedDescriptor(expected_tok_only_check, "anthropic", "claude-sonnet-4-5", "tokens", 250,
+                        envoy::type::v3::MINUTE, 1000, 1);
+  expectRlsCall("CheckRateLimit", expected_tok_only_check, RateLimitResponse::OK);
+  EXPECT_THAT(runTask(quota->checkLimits("anthropic", "claude-sonnet-4-5", 250)),
+              IsOkAndHolds(true));
+
+  RateLimitRequest expected_tok_only_consume_zero;
+  expected_tok_only_consume_zero.set_domain("ai_model_routing");
+  addExpectedDescriptor(expected_tok_only_consume_zero, "anthropic", "claude-sonnet-4-5",
+                        "requests", 1);
+  expectRlsCall("ConsumeRateLimit", expected_tok_only_consume_zero);
+  EXPECT_THAT(runTask(quota->consumeQuota("anthropic", "claude-sonnet-4-5", 0, 0)), IsOk());
+}
+
+TEST_F(RlsQuotaTest, SaturatesTotalTokensOnAdditionOverflow) {
+  Config::ModelRateLimit proto;
+  auto quota = createQuota(proto);
+
+  RateLimitRequest expected_consume;
+  expected_consume.set_domain("ai_model_routing");
+  addExpectedDescriptor(expected_consume, "openai", "gpt-4o", "requests", 1);
+  addExpectedDescriptor(expected_consume, "openai", "gpt-4o", "tokens",
+                        std::numeric_limits<uint64_t>::max());
+  expectRlsCall("ConsumeRateLimit", expected_consume);
+  EXPECT_THAT(
+      runTask(quota->consumeQuota("openai", "gpt-4o", std::numeric_limits<uint64_t>::max(), 10)),
+      IsOk());
 }
 
 TEST_F(RlsQuotaTest, RpcFailurePropagatesError) {

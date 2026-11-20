@@ -44,6 +44,14 @@ constexpr absl::string_view ClaudeSonnetUnaryResponse = R"({
   "usage": {"input_tokens": 12, "output_tokens": 6}
 })";
 
+constexpr absl::string_view ClaudeOpusUnaryResponse = R"({
+  "id": "msg_03", "type": "message", "role": "assistant",
+  "model": "claude-opus-5-5",
+  "content": [{"type": "text", "text": "Hello from Claude Opus."}],
+  "stop_reason": "end_turn", "stop_sequence": null,
+  "usage": {"input_tokens": 12, "output_tokens": 6}
+})";
+
 constexpr std::pair<absl::string_view, absl::string_view> ClaudeStreamEvents[] = {
     {"message_start",
      R"({"type":"message_start","message":{"id":"msg_01","type":"message",)"
@@ -119,10 +127,7 @@ typed_config:
       - name: envoy.http.ai_filters.model_rate_limit
         typed_config:
           "@type": type.googleapis.com/envoy.extensions.http.ai_filters.model_rate_limit.v3.ModelRateLimit
-          backend:
-            name: local
-            typed_config:
-              "@type": type.googleapis.com/envoy.extensions.http.ai_filters.model_rate_limit.v3.LocalQuotaConfig
+          local: {}
       - name: envoy.http.ai_filters.transcoder
         typed_config:
           "@type": type.googleapis.com/envoy.extensions.http.ai_filters.transcoder.v3.Transcoder
@@ -219,8 +224,7 @@ public:
                   .PackFrom(gemini_per_route);
 
           hcm.clear_http_filters();
-          TestUtility::loadFromYaml(std::string(DownstreamAiProtocolManagerConfig),
-                                    *hcm.add_http_filters());
+          TestUtility::loadFromYaml(downstream_config_, *hcm.add_http_filters());
 
           auto* router_http_filter = hcm.add_http_filters();
           TestUtility::loadFromYaml(std::string(RouterWithUpstreamAiProtocolManagerConfig),
@@ -298,6 +302,7 @@ public:
   }
 
   bool enable_rls_{false};
+  std::string downstream_config_{DownstreamAiProtocolManagerConfig};
   envoy::extensions::http::ai_filters::model_rate_limit::v3::ModelRateLimit rate_limit_proto_;
   FakeHttpConnectionPtr fake_rls_connection_;
 };
@@ -321,10 +326,7 @@ limits:
       - quota_type: REQUESTS
         time_unit: HOUR
         limit: 1
-backend:
-  name: local
-  typed_config:
-    "@type": type.googleapis.com/envoy.extensions.http.ai_filters.model_rate_limit.v3.LocalQuotaConfig
+local: {}
 )EOF",
                             rate_limit_proto_);
   initialize();
@@ -373,10 +375,7 @@ limits:
       - quota_type: TOKENS
         time_unit: HOUR
         limit: 15
-backend:
-  name: local
-  typed_config:
-    "@type": type.googleapis.com/envoy.extensions.http.ai_filters.model_rate_limit.v3.LocalQuotaConfig
+local: {}
 )EOF",
                             rate_limit_proto_);
   initialize();
@@ -427,14 +426,11 @@ backend:
 TEST_P(ModelRateLimitIntegrationTest, RlsQuotaRetriesOverLimitModelAndConsumesActualTokens) {
   enable_rls_ = true;
   TestUtility::loadFromYaml(R"EOF(
-backend:
-  name: rls
-  typed_config:
-    "@type": type.googleapis.com/envoy.extensions.http.ai_filters.model_rate_limit.v3.RlsQuotaConfig
-    grpc_service:
-      envoy_grpc:
-        cluster_name: rls_cluster
-    timeout: 5s
+rls:
+  grpc_service:
+    envoy_grpc:
+      cluster_name: rls_cluster
+  timeout: 5s
 )EOF",
                             rate_limit_proto_);
   initialize();
@@ -511,6 +507,116 @@ backend:
   ASSERT_TRUE(fake_rls_connection_->close());
   ASSERT_TRUE(fake_rls_connection_->waitForDisconnect());
   cleanupUpstreamAndDownstream();
+}
+
+TEST_P(ModelRateLimitIntegrationTest,
+       Upstream429DoesNotConsumeQuotaAndSharesRetryBudgetWithLocal429) {
+  downstream_config_ = R"EOF(
+name: envoy.filters.http.ai_protocol_manager
+typed_config:
+  "@type": type.googleapis.com/envoy.extensions.filters.http.ai_protocol_manager.v3.AiProtocolManager
+  request_handling: {}
+  filters:
+  - name: envoy.http.ai_filters.schema_validation
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.http.ai_filters.schema_validation.v3.SchemaValidation
+  - name: envoy.http.ai_filters.request_info
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.http.ai_filters.request_info.v3.RequestInfo
+  - name: envoy.http.ai_filters.model_router
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.http.ai_filters.model_router.v3.ModelRouter
+      providers:
+      - name: anthropic
+        llm_protocol: ANTHROPIC_MESSAGES
+        host_and_port: "api.anthropic.com"
+        binding:
+          uri_pattern: "/v1/messages"
+      models:
+      - name: antroclaude-haiku
+        provider: anthropic
+        model: "claude-haiku-5-5"
+        api_key:
+          inline_string: "Bearer ANTHROPIC_KEY"
+      - name: antroclaude-sonnet
+        provider: anthropic
+        model: "claude-sonnet-5-5"
+        api_key:
+          inline_string: "Bearer ANTHROPIC_KEY"
+      - name: antroclaude-opus
+        provider: anthropic
+        model: "claude-opus-5-5"
+        api_key:
+          inline_string: "Bearer ANTHROPIC_KEY"
+      routes:
+      - requested_model: "send_me_to_anthropic"
+        targets:
+        - model: antroclaude-haiku
+        - model: antroclaude-sonnet
+        - model: antroclaude-opus
+)EOF";
+
+  TestUtility::loadFromYaml(R"EOF(
+limits:
+  - provider: anthropic
+    model: claude-haiku-5-5
+    quotas:
+      - quota_type: REQUESTS
+        time_unit: HOUR
+        limit: 1
+local: {}
+)EOF",
+                            rate_limit_proto_);
+  initialize();
+
+  // 1. Request 1: `claude-haiku-5-5` passes quota check, but upstream returns 429; router retries
+  // onto `claude-sonnet-5-5` (200 OK). `claude-haiku-5-5` quota must NOT be consumed.
+  IntegrationStreamDecoderPtr response1 = sendChatCompletionsRequest();
+  waitForAnthropicUpstreamRequest("claude-haiku-5-5");
+  upstream_request_->encodeHeaders(
+      Http::TestResponseHeaderMapImpl{{":status", "429"}, {"content-type", "application/json"}},
+      false);
+  upstream_request_->encodeData(R"({"error":{"message":"rate limited upstream"}})", true);
+
+  waitForAnthropicUpstreamRequest("claude-sonnet-5-5");
+  upstream_request_->encodeHeaders(
+      Http::TestResponseHeaderMapImpl{{":status", "200"}, {"content-type", "application/json"}},
+      false);
+  upstream_request_->encodeData(std::string(ClaudeSonnetUnaryResponse), true);
+  ASSERT_TRUE(response1->waitForEndStream());
+  ASSERT_THAT(response1->headers(), Http::HttpStatusIs("200")) << response1->body();
+
+  // 2. Request 2: Because `claude-haiku-5-5` did not consume quota on the upstream 429, it is
+  // still admitted on attempt 1 and now consumes its 1-request quota on 200 OK.
+  IntegrationStreamDecoderPtr response2 = sendChatCompletionsRequest();
+  waitForAnthropicUpstreamRequest("claude-haiku-5-5");
+  upstream_request_->encodeHeaders(
+      Http::TestResponseHeaderMapImpl{{":status", "200"}, {"content-type", "application/json"}},
+      false);
+  upstream_request_->encodeData(std::string(ClaudeHaikuUnaryResponse), true);
+  ASSERT_TRUE(response2->waitForEndStream());
+  ASSERT_THAT(response2->headers(), Http::HttpStatusIs("200")) << response2->body();
+  EXPECT_EQ(nlohmann::json::parse(response2->body())["choices"][0]["message"]["content"],
+            "Hello from Claude Haiku.");
+
+  // 3. Request 3: Attempt 1 hits local `model_rate_limit` 429 on `claude-haiku-5-5`, attempt 2
+  // hits upstream 429 on `claude-sonnet-5-5`, and attempt 3 succeeds on `claude-opus-5-5`.
+  IntegrationStreamDecoderPtr response3 = sendChatCompletionsRequest();
+  waitForAnthropicUpstreamRequest("claude-sonnet-5-5");
+  upstream_request_->encodeHeaders(
+      Http::TestResponseHeaderMapImpl{{":status", "429"}, {"content-type", "application/json"}},
+      false);
+  upstream_request_->encodeData(R"({"error":{"message":"sonnet overloaded"}})", true);
+
+  waitForAnthropicUpstreamRequest("claude-opus-5-5");
+  upstream_request_->encodeHeaders(
+      Http::TestResponseHeaderMapImpl{{":status", "200"}, {"content-type", "application/json"}},
+      false);
+  upstream_request_->encodeData(std::string(ClaudeOpusUnaryResponse), true);
+  ASSERT_TRUE(response3->waitForEndStream());
+  ASSERT_THAT(response3->headers(), Http::HttpStatusIs("200")) << response3->body();
+  EXPECT_EQ(nlohmann::json::parse(response3->body())["choices"][0]["message"]["content"],
+            "Hello from Claude Opus.");
 }
 
 } // namespace

@@ -2,7 +2,6 @@ syntax = "proto3";
 
 package envoy.extensions.http.ai_filters.model_rate_limit.v3;
 
-import "envoy/config/core/v3/extension.proto";
 import "envoy/config/core/v3/grpc_service.proto";
 
 import "google/protobuf/duration.proto";
@@ -61,7 +60,16 @@ message Quota {
   TimeUnit time_unit = 2 [(validate.rules).enum = {defined_only: true not_in: 0}];
 
   // Maximum allowed usage within the time window. Setting ``limit`` to ``0`` disables the model.
-  uint32 limit = 3;
+  //
+  // For ``TOKENS`` quotas, ``limit`` must be at least as large as any single request's estimated
+  // input token count; a request whose estimated input tokens exceed ``limit`` will always be
+  // rejected.
+  //
+  // When used as a client-side override with :ref:`RlsQuotaConfig
+  // <envoy_v3_api_msg_extensions.http.ai_filters.model_rate_limit.v3.RlsQuotaConfig>`, ``limit``
+  // must not exceed ``4294967295`` (``UINT32_MAX``) because
+  // ``RateLimitOverride.requests_per_unit`` is a 32-bit unsigned integer.
+  uint64 limit = 3;
 
   // The number of time units in the quota window. For example, a value of ``6`` with a
   // ``time_unit`` of ``HOUR`` specifies a 6-hour rolling window. If not specified, defaults to
@@ -83,14 +91,29 @@ message ModelLimit {
 
   // Usage quotas enforced for this model. If any configured quota is reached or exceeded, the
   // request is rejected with ``429 Too Many Requests``.
-  repeated Quota quotas = 3;
+  repeated Quota quotas = 3 [(validate.rules).repeated = {min_items: 1}];
 }
 
-// Configuration for tracking model usage quotas locally in memory.
+// Configuration for tracking model usage quotas locally in memory within this Envoy process.
+// Quota state is shared across worker threads via atomic token buckets.
 message LocalQuotaConfig {
 }
 
-// Configuration for tracking model usage quotas via an external gRPC RateLimitService (RLS).
+// Configuration for tracking model usage quotas via an external gRPC ``RateLimitService`` (RLS).
+//
+// .. important::
+//
+//   The target ``envoy.service.ratelimit.v3.RateLimitService`` server must implement both the
+//   ``CheckRateLimit`` (non-consuming check on request decode) and ``ConsumeRateLimit``
+//   (unconditional post-response deduction) RPCs in ``envoy/service/ratelimit/v3/rls.proto``.
+//
+// Each RPC sends descriptors with entries ``("provider", <provider>)``, ``("model", <model>)``,
+// and ``("quota_type", "requests" | "tokens")``, with ``hits_addend`` set to the checked or
+// consumed amount. When a model has overrides in :ref:`limits
+// <envoy_v3_api_field_extensions.http.ai_filters.model_rate_limit.v3.ModelRateLimit.limits>`,
+// ``RateLimitOverride`` is attached per quota type; any quota type not overridden in ``ModelLimit``
+// still sends its default unoverridden descriptor so server-side limits for that quota type remain
+// active.
 message RlsQuotaConfig {
   // Specifies the gRPC service that hosts the rate limit service.
   config.core.v3.GrpcService grpc_service = 1 [(validate.rules).message = {required: true}];
@@ -104,16 +127,61 @@ message RlsQuotaConfig {
 }
 
 // Configuration for the Model Rate Limit AI filter.
+//
+// This filter is designed to run inside an upstream cluster's ``AiProtocolManager`` filter chain
+// immediately after ``envoy.http.ai_filters.route_selector`` (which populates the
+// ``envoy.ai.provider`` and ``envoy.ai.model.resolved`` filter state keys for the current retry
+// attempt). To include pre-dispatch input token estimates in quota checks, run
+// ``envoy.http.ai_filters.request_info`` with ``token_estimation`` ahead of this filter; to deduct
+// actual provider-reported input and output tokens, enable ``response_handling.token_usage`` on the
+// ``AiProtocolManager`` filter.
+//
+// **Retry configuration:** When a candidate model exceeds its quota, this filter replies locally
+// with ``429 Too Many Requests``. For Envoy's router to advance to the next fallback model produced
+// by ``model_router``, configure ``include_request_attempt_count: true`` on the virtual host or
+// route and configure a route ``retry_policy`` with ``retry_on`` containing
+// ``retriable-status-codes`` and ``retriable_status_codes`` containing ``429``. Local ``429``
+// replies from this filter and ``429`` responses from upstream AI providers share the route's retry
+// budget.
+//
+// **Soft post-hoc quota semantics:** Quotas are checked without upfront reservation during request
+// decode and deducted only after a ``2xx`` response body completes:
+//
+// * Requests rejected by the upstream AI provider with a non-``2xx`` status intentionally do not
+//   consume quota even though the request was sent upstream.
+// * Concurrent bursts arriving before in-flight LLM responses finish can temporarily exceed soft
+//   limits; excess token usage places local token buckets into debt until refilled.
+// * Streaming responses aborted by a client disconnect before end-of-stream, as well as
+//   headers-only (``204``) or compressed responses skipped by ``AiProtocolManager``, do not deduct
+//   quota.
+// * At response end-of-stream, quota deduction (including ``ConsumeRateLimit`` when using ``rls``,
+//   bounded by ``RlsQuotaConfig.timeout``) is awaited before forwarding ``END_STREAM`` downstream.
+// [#next-free-field: 6]
 message ModelRateLimit {
-  // Limits for some or all models.
-  // For local quotas, this list is the source of truth. Models not in the list can be used without
-  // limits. For RLS quotas, quotas are normally configured in the RLS config; this list serves as
-  // an override and can be empty.
+  // Per-model usage limits.
+  //
+  // For ``local`` quotas, this list is the source of truth; models not listed are unrestricted.
+  // For ``rls`` quotas, limits are normally configured on the RLS server and entries here act as
+  // per-quota-type client-side overrides (may be left empty).
   repeated ModelLimit limits = 1;
 
-  // Backend configuration (e.g., :ref:`LocalQuotaConfig
-  // <envoy_v3_api_msg_extensions.http.ai_filters.model_rate_limit.v3.LocalQuotaConfig>` or
-  // :ref:`RlsQuotaConfig
-  // <envoy_v3_api_msg_extensions.http.ai_filters.model_rate_limit.v3.RlsQuotaConfig>`).
-  config.core.v3.TypedExtensionConfig backend = 2 [(validate.rules).message = {required: true}];
+  oneof backend {
+    option (validate.required) = true;
+
+    // Track quotas locally in memory within this Envoy process.
+    LocalQuotaConfig local = 2;
+
+    // Track quotas via an external gRPC ``RateLimitService`` implementing ``CheckRateLimit`` and
+    // ``ConsumeRateLimit``.
+    RlsQuotaConfig rls = 3;
+  }
+
+  // Dynamic metadata namespace from which to read ``envoy.data.ai.v3.RequestInfo`` for
+  // ``estimated_input_tokens`` during request decode. If empty, defaults to
+  // ``envoy.ai.request_info``.
+  string request_info_metadata_namespace = 4;
+
+  // Dynamic metadata namespace from which to read ``envoy.data.ai.v3.TokenUsage`` on response
+  // completion. If empty, defaults to ``envoy.ai.token_usage``.
+  string token_usage_metadata_namespace = 5;
 }

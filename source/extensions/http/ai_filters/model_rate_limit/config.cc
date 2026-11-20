@@ -1,20 +1,18 @@
 #include "source/extensions/http/ai_filters/model_rate_limit/config.h"
 
 #include <memory>
-#include <string>
 #include <utility>
 
+#include "envoy/grpc/async_client_manager.h"
 #include "envoy/registry/registry.h"
 
-#include "source/common/config/utility.h"
+#include "source/common/common/assert.h"
 #include "source/common/protobuf/utility.h"
 #include "source/extensions/http/ai_filters/model_rate_limit/filter.h"
 #include "source/extensions/http/ai_filters/model_rate_limit/local_quota.h"
 #include "source/extensions/http/ai_filters/model_rate_limit/rls_quota.h"
 
-#include "absl/status/status.h"
 #include "absl/status/status_macros.h"
-#include "absl/strings/str_cat.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -23,8 +21,6 @@ namespace ModelRateLimit {
 
 using ModelRateLimitProto =
     envoy::extensions::http::ai_filters::model_rate_limit::v3::ModelRateLimit;
-using LocalQuotaConfigProto =
-    envoy::extensions::http::ai_filters::model_rate_limit::v3::LocalQuotaConfig;
 using RlsQuotaConfigProto =
     envoy::extensions::http::ai_filters::model_rate_limit::v3::RlsQuotaConfig;
 
@@ -35,49 +31,47 @@ ModelRateLimitFilterConfigFactory::createAiFilterFactory(
   const auto& proto = MessageUtil::downcastAndValidate<const ModelRateLimitProto&>(
       config, context.messageValidationVisitor());
 
-  const auto& typed_config = proto.backend().typed_config();
-  const std::string type = Config::Utility::getFactoryType(typed_config);
   ThreadLocal::SlotAllocator& slot_allocator = context.threadLocal();
   ModelRateLimitFilterConfig::QuotaPtr tl_quota =
       ThreadLocal::TypedSlot<QuotaInterface>::makeUnique(slot_allocator);
 
-  if (type == LocalQuotaConfigProto::default_instance().GetTypeName()) {
-    LocalQuotaConfigProto local_config;
-    ABSL_RETURN_IF_ERROR(Config::Utility::translateOpaqueConfig(
-        typed_config, context.messageValidationVisitor(), local_config));
-    MessageUtil::validate(local_config, context.messageValidationVisitor());
-
+  switch (proto.backend_case()) {
+  case ModelRateLimitProto::kLocal: {
     ABSL_ASSIGN_OR_RETURN(LocalQuota base_quota, LocalQuota::create(proto, context.timeSource()));
     tl_quota->set([base_quota = std::move(base_quota)](
                       Event::Dispatcher&) -> std::shared_ptr<QuotaInterface> {
       return std::make_shared<LocalQuota>(base_quota);
     });
-  } else if (type == RlsQuotaConfigProto::default_instance().GetTypeName()) {
-    RlsQuotaConfigProto rls_config;
-    ABSL_RETURN_IF_ERROR(Config::Utility::translateOpaqueConfig(
-        typed_config, context.messageValidationVisitor(), rls_config));
-    MessageUtil::validate(rls_config, context.messageValidationVisitor());
-
+    break;
+  }
+  case ModelRateLimitProto::kRls: {
+    const RlsQuotaConfigProto& rls_config = proto.rls();
     ABSL_ASSIGN_OR_RETURN(std::shared_ptr<const RlsQuota::ModelQuotaMap> quota_map,
                           RlsQuota::buildQuotaMap(proto));
-    Grpc::AsyncClientFactoryPtr factory;
-    ABSL_ASSIGN_OR_RETURN(factory,
-                          context.clusterManager().grpcAsyncClientManager().factoryForGrpcService(
-                              rls_config.grpc_service(), scope, true));
+    Grpc::GrpcServiceConfigWithHashKey config_with_hash_key(rls_config.grpc_service());
+    ABSL_ASSIGN_OR_RETURN(
+        Grpc::RawAsyncClientSharedPtr validation_client,
+        context.clusterManager().grpcAsyncClientManager().getOrCreateRawAsyncClientWithHashKey(
+            config_with_hash_key, context.scope(), true));
+    UNREFERENCED_PARAMETER(validation_client);
 
-    std::shared_ptr<Grpc::AsyncClientFactory> shared_factory = std::move(factory);
-    tl_quota->set([quota_map = std::move(quota_map), rls_config,
-                   shared_factory](Event::Dispatcher&) -> std::shared_ptr<QuotaInterface> {
-      absl::StatusOr<Grpc::RawAsyncClientPtr> raw_client =
-          shared_factory->createUncachedRawAsyncClient();
-      Grpc::RawAsyncClientSharedPtr client = raw_client.ok() ? std::move(*raw_client) : nullptr;
-      return std::make_shared<RlsQuota>(quota_map, rls_config, std::move(client));
+    tl_quota->set([quota_map = std::move(quota_map), rls_config, config_with_hash_key,
+                   &context](Event::Dispatcher&) -> std::shared_ptr<QuotaInterface> {
+      absl::StatusOr<Grpc::RawAsyncClientSharedPtr> raw_client =
+          context.clusterManager().grpcAsyncClientManager().getOrCreateRawAsyncClientWithHashKey(
+              config_with_hash_key, context.scope(), true);
+      RELEASE_ASSERT(raw_client.ok(), raw_client.status().ToString());
+      return std::make_shared<RlsQuota>(quota_map, rls_config, std::move(*raw_client));
     });
-  } else {
-    return absl::InvalidArgumentError(absl::StrCat("Unknown backend type: ", type));
+    break;
+  }
+  case ModelRateLimitProto::BACKEND_NOT_SET: // LCOV_EXCL_LINE
+    PANIC_DUE_TO_PROTO_UNSET;                // LCOV_EXCL_LINE
   }
 
-  auto filter_config = std::make_shared<ModelRateLimitFilterConfig>(std::move(tl_quota), scope);
+  auto filter_config = std::make_shared<ModelRateLimitFilterConfig>(
+      std::move(tl_quota), scope, proto.request_info_metadata_namespace(),
+      proto.token_usage_metadata_namespace());
 
   return [filter_config](const HttpFilters::AiProtocolManager::AiFilterContext& stream_context)
              -> HttpFilters::AiProtocolManager::AiFilterSharedPtr {

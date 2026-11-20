@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <string>
 #include <utility>
@@ -102,18 +103,20 @@ RlsQuota::buildQuotaMap(const Config::ModelRateLimit& proto) {
       return absl::InvalidArgumentError(absl::StrCat("Duplicate model limit for provider ",
                                                      key.provider, " and model ", key.model));
     }
-    if (model_entry.quotas().empty()) {
-      continue;
-    }
 
     ModelQuotas& model_quotas = (*map)[std::move(key)];
     for (const Config::Quota& quota : model_entry.quotas()) {
+      if (quota.limit() > std::numeric_limits<uint32_t>::max()) {
+        return absl::InvalidArgumentError(absl::StrCat(
+            "RLS quota override limit ", quota.limit(), " exceeds UINT32_MAX for provider ",
+            model_entry.provider(), " and model ", model_entry.model()));
+      }
       if (quota.limit() == 0) {
         model_quotas.disabled = true;
       }
 
       RateLimitOverride override_limit;
-      override_limit.set_requests_per_unit(quota.limit());
+      override_limit.set_requests_per_unit(static_cast<uint32_t>(quota.limit()));
       override_limit.set_unit(toRateLimitUnit(quota.time_unit()));
       const uint32_t multiplier = PROTOBUF_GET_WRAPPED_OR_DEFAULT(quota, unit_multiplier, 1);
       if (multiplier != 1) {
@@ -148,26 +151,37 @@ Coroutine::Task<absl::StatusOr<bool>> RlsQuota::checkLimits(std::string provider
     if (model_quotas.disabled) {
       co_return false;
     }
-    for (const RateLimitOverride& override_limit : model_quotas.request_overrides) {
-      addDescriptor(request, provider, model, RequestsQuotaTypeValue, 1, &override_limit);
+    if (model_quotas.request_overrides.empty()) {
+      addDescriptor(request, provider, model, RequestsQuotaTypeValue, 1);
+    } else {
+      for (const RateLimitOverride& override_limit : model_quotas.request_overrides) {
+        addDescriptor(request, provider, model, RequestsQuotaTypeValue, 1, &override_limit);
+      }
     }
-    for (const RateLimitOverride& override_limit : model_quotas.token_overrides) {
-      addDescriptor(request, provider, model, TokensQuotaTypeValue, required_tokens,
-                    &override_limit);
+    if (model_quotas.token_overrides.empty()) {
+      addDescriptor(request, provider, model, TokensQuotaTypeValue, required_tokens);
+    } else {
+      for (const RateLimitOverride& override_limit : model_quotas.token_overrides) {
+        addDescriptor(request, provider, model, TokensQuotaTypeValue, required_tokens,
+                      &override_limit);
+      }
     }
   } else {
     addDescriptor(request, provider, model, RequestsQuotaTypeValue, 1);
     addDescriptor(request, provider, model, TokensQuotaTypeValue, required_tokens);
   }
 
-  ASSIGN_OR_CO_RETURN(RateLimitResponse response, co_await client_.checkRateLimit(request));
+  ASSIGN_OR_CO_RETURN(RateLimitResponse response,
+                      co_await client_.checkRateLimit(std::move(request)));
   co_return response.overall_code() != RateLimitResponse::OVER_LIMIT;
 }
 
 Coroutine::Task<absl::Status> RlsQuota::consumeQuota(std::string provider, std::string model,
                                                      uint64_t input_tokens,
                                                      uint64_t output_tokens) {
-  const uint64_t total_tokens = input_tokens + output_tokens;
+  const uint64_t total_tokens = input_tokens > std::numeric_limits<uint64_t>::max() - output_tokens
+                                    ? std::numeric_limits<uint64_t>::max()
+                                    : input_tokens + output_tokens;
   RateLimitRequest request;
   request.set_domain(domain_);
 
@@ -177,17 +191,21 @@ Coroutine::Task<absl::Status> RlsQuota::consumeQuota(std::string provider, std::
     if (model_quotas.disabled) {
       co_return absl::OkStatus();
     }
-    if (model_quotas.request_overrides.empty() &&
-        (model_quotas.token_overrides.empty() || total_tokens == 0)) {
-      co_return absl::OkStatus();
-    }
-    for (const RateLimitOverride& override_limit : model_quotas.request_overrides) {
-      addDescriptor(request, provider, model, RequestsQuotaTypeValue, 1, &override_limit);
+    if (model_quotas.request_overrides.empty()) {
+      addDescriptor(request, provider, model, RequestsQuotaTypeValue, 1);
+    } else {
+      for (const RateLimitOverride& override_limit : model_quotas.request_overrides) {
+        addDescriptor(request, provider, model, RequestsQuotaTypeValue, 1, &override_limit);
+      }
     }
     if (total_tokens > 0) {
-      for (const RateLimitOverride& override_limit : model_quotas.token_overrides) {
-        addDescriptor(request, provider, model, TokensQuotaTypeValue, total_tokens,
-                      &override_limit);
+      if (model_quotas.token_overrides.empty()) {
+        addDescriptor(request, provider, model, TokensQuotaTypeValue, total_tokens);
+      } else {
+        for (const RateLimitOverride& override_limit : model_quotas.token_overrides) {
+          addDescriptor(request, provider, model, TokensQuotaTypeValue, total_tokens,
+                        &override_limit);
+        }
       }
     }
   } else {
@@ -197,7 +215,7 @@ Coroutine::Task<absl::Status> RlsQuota::consumeQuota(std::string provider, std::
     }
   }
 
-  CO_RETURN_IF_ERROR((co_await client_.consumeRateLimit(request)).status());
+  CO_RETURN_IF_ERROR((co_await client_.consumeRateLimit(std::move(request))).status());
   co_return absl::OkStatus();
 }
 

@@ -56,9 +56,6 @@ LocalQuota::buildQuotaMap(const Config::ModelRateLimit& proto, TimeSource& time_
       return absl::InvalidArgumentError(absl::StrCat("Duplicate model limit for provider ",
                                                      key.provider, " and model ", key.model));
     }
-    if (model_entry.quotas().empty()) {
-      continue;
-    }
 
     ModelQuotas& model_quotas = (*map)[std::move(key)];
     for (const Config::Quota& quota : model_entry.quotas()) {

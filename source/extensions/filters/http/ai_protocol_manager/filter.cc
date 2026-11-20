@@ -494,8 +494,8 @@ void AiProtocolManagerFilter::finalizeDecode(bool has_trailers) {
   decode_manager_->endStream();
   auto on_complete = [this, has_trailers](absl::Status status) {
     if (!status.ok()) {
-      ENVOY_LOG(debug, "ai_protocol_manager: replay failed: {}", status.message());
       if (!payload_rejected_) {
+        ENVOY_LOG(error, "ai_protocol_manager: replay failed: {}", status.message());
         payload_rejected_ = true;
         decoder_callbacks_->sendLocalReply(Http::Code::BadGateway, status.message(), nullptr,
                                            std::nullopt, "ai_protocol_manager_replay_error");

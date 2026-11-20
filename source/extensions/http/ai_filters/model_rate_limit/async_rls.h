@@ -26,10 +26,10 @@ public:
   ~AsyncRlsClient() = default;
 
   Coroutine::Task<absl::StatusOr<envoy::service::ratelimit::v3::RateLimitResponse>>
-  checkRateLimit(const envoy::service::ratelimit::v3::RateLimitRequest& request);
+  checkRateLimit(envoy::service::ratelimit::v3::RateLimitRequest request);
 
   Coroutine::Task<absl::StatusOr<envoy::service::ratelimit::v3::RateLimitResponse>>
-  consumeRateLimit(const envoy::service::ratelimit::v3::RateLimitRequest& request);
+  consumeRateLimit(envoy::service::ratelimit::v3::RateLimitRequest request);
 
 private:
   Grpc::RawAsyncClientSharedPtr raw_client_;
